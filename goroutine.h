@@ -18,6 +18,6 @@ typedef struct goroutine {
 //function declarations as below
 goroutine_t* create_goroutine(void (*func)(void*), void *arg);
 void run_goroutine(goroutine_t *g);
-void free_goroutne(goroutine_t *g);
+void free_goroutine(goroutine_t *g);
 
 #endif
