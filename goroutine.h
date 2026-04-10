@@ -9,18 +9,18 @@
 #define GOROUTINE_RUNNING  1
 #define GOROUTINE_FINISHED 2
 
-//a simple goroutine structure
+// Simple goroutine structure
 typedef struct goroutine {
-	ucontext_t context;
-	void *stack;
-	size_t stack_size;
-	int id;
-	int state; //0for ready, lly 1:runnig, 2:finished
-	void (*function)(void*);
-	void *arg;
+    ucontext_t context;
+    void *stack;
+    size_t stack_size;
+    int id;
+    int state;  // 0: ready, 1: running, 2: finished
+    void (*function)(void*);
+    void *arg;
 } goroutine_t;
 
-//function declarations as below
+// Function declarations
 goroutine_t* create_goroutine(void (*func)(void*), void *arg);
 void run_goroutine(goroutine_t *g);
 void free_goroutine(goroutine_t *g);
