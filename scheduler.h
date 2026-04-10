@@ -18,3 +18,4 @@ void scheduler_add(scheduler_t *s, goroutine_t *g);
 void scheduler_run(scheduler_t *s);
 void scheduler_yield(scheduler_t *s);
 
+#endif

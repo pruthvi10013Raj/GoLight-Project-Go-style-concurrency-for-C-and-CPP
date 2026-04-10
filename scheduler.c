@@ -22,7 +22,7 @@ void scheduler_add(scheduler_t *s, goroutine_t *g){
 void scheduler_run(scheduler_t *s){
 	if (s->count == 0) return;
 
-	getcontext(&s->main-context);//saving the main context
+	getcontext(&s->main_context);//saving the main context
 
 	
 	for(int i = 0; i < s->count; i++){
@@ -31,11 +31,11 @@ void scheduler_run(scheduler_t *s){
 
 		if(g->state == 0) {
 			//present state = runnig state
-			printf("\n Scheduler: Switching to goroutind\n", g->id);
+			printf("\n Scheduler: Switching to goroutine %d\n", g->id);
 			g->state = 1;// state set to running
 
 			//setting where to go when done
-			g->context.uc_link = &s->main_context);
+			g->context.uc_link = &s->main_context;
 
 			//switch to goroutine
 			swapcontext(&s->main_context, &g->context);

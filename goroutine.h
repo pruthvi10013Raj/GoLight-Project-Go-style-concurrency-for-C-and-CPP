@@ -4,6 +4,11 @@
 #include <ucontext.h>
 #include <stddef.h>
 
+// Goroutine state constants
+#define GOROUTINE_READY    0
+#define GOROUTINE_RUNNING  1
+#define GOROUTINE_FINISHED 2
+
 //a simple goroutine structure
 typedef struct goroutine {
 	ucontext_t context;
