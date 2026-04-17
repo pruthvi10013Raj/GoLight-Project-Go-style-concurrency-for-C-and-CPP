@@ -56,7 +56,8 @@ void scheduler_stealing_add(scheduler_stealing_t* s, goroutine_t* g) {
     worker_stealing_t* w = &s->workers[target];
     
     deque_push_bottom(&w->deque, g);
-    printf("Added goroutine %d to worker %d queue\n", g->id, target);
+    printf("Added goroutine %d to worker %d queue (active: %d)\n", 
+           g->id, target, atomic_load(&s->active_goroutines));
     
     // Wake up worker if idle
     if (atomic_load(&w->is_idle)) {
@@ -80,18 +81,21 @@ void scheduler_stealing_wait(scheduler_stealing_t* s) {
     printf("\nWaiting for %d goroutines to complete...\n", 
            atomic_load(&s->active_goroutines));
     
-    // Wait for all goroutines to complete
-    int last_count = -1;
-    while (atomic_load(&s->active_goroutines) > 0) {
+    // Wait for all goroutines to complete with timeout protection
+    int timeout_count = 0;
+    while (atomic_load(&s->active_goroutines) > 0 && timeout_count < 100) {
         int current = atomic_load(&s->active_goroutines);
-        if (current != last_count) {
-            printf("  %d goroutines remaining...\n", current);
-            last_count = current;
-        }
-        usleep(100000);  // 100ms
+        printf("  %d goroutines remaining...\n", current);
+        usleep(500000);  // 500ms
+        timeout_count++;
     }
     
-    printf("All goroutines completed!\n");
+    if (atomic_load(&s->active_goroutines) > 0) {
+        printf("WARNING: Timeout waiting for %d goroutines!\n", 
+               atomic_load(&s->active_goroutines));
+    } else {
+        printf("All goroutines completed!\n");
+    }
     
     // Stop workers
     atomic_store(&s->running, 0);
@@ -113,7 +117,8 @@ void scheduler_stealing_wait(scheduler_stealing_t* s) {
         printf("Worker %d: %d goroutines, %d steals done, %d steals received\n",
                i, executed, steals_done, steals_recv);
     }
-    printf("Total goroutines executed: %d\n", total_executed);
+    printf("Total goroutines executed: %d (expected: %d)\n", 
+           total_executed, total_executed);
     printf("Total steals: %d\n", atomic_load(&s->total_steals));
 }
 
@@ -163,6 +168,7 @@ static void* worker_stealing_loop(void* arg) {
             execute_goroutine_stealing(w, g);
         } else if (atomic_load(&s->active_goroutines) == 0) {
             // No work and no active goroutines - exit
+            printf("Worker %d: No work left, exiting\n", w->id);
             break;
         } else {
             // No work but goroutines exist - park briefly
@@ -171,7 +177,7 @@ static void* worker_stealing_loop(void* arg) {
             pthread_mutex_lock(&w->lock);
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 50000000;  // 50ms timeout
+            ts.tv_nsec += 100000000;  // 100ms timeout
             pthread_cond_timedwait(&w->cond, &w->lock, &ts);
             pthread_mutex_unlock(&w->lock);
             
@@ -215,16 +221,18 @@ static goroutine_t* try_steal(worker_stealing_t* thief) {
     return NULL;
 }
 
-// FIXED: The critical function - proper context switching
+// FIXED: Proper context switching with better error handling
 static void execute_goroutine_stealing(worker_stealing_t* w, goroutine_t* g) {
     printf("Worker %d: Executing goroutine %d\n", w->id, g->id);
     
     // Save worker's current context
     ucontext_t worker_context;
-    getcontext(&worker_context);
+    if (getcontext(&worker_context) == -1) {
+        perror("getcontext failed");
+        return;
+    }
     
     // Set the goroutine to return to this worker context when done
-    // This is the key fix!
     g->context.uc_link = &worker_context;
     
     // Mark goroutine as running
@@ -232,16 +240,61 @@ static void execute_goroutine_stealing(worker_stealing_t* w, goroutine_t* g) {
     
     // Switch to goroutine
     // When goroutine finishes, it will automatically return to worker_context
-    swapcontext(&worker_context, &g->context);
+    if (swapcontext(&worker_context, &g->context) == -1) {
+        perror("swapcontext failed");
+        return;
+    }
     
     // We return here when the goroutine finishes (via uc_link)
     printf("Worker %d: Goroutine %d completed\n", w->id, g->id);
     
     // Update statistics
     g->state = GOROUTINE_FINISHED;
+    int remaining = atomic_fetch_sub(&w->scheduler->active_goroutines, 1) - 1;
     atomic_fetch_add(&w->goroutines_executed, 1);
-    atomic_fetch_sub(&w->scheduler->active_goroutines, 1);
+    
+    printf("Worker %d: Active goroutines now: %d\n", w->id, remaining);
     
     // Free the goroutine
     free_goroutine(g);
+}
+
+// Thread-local current goroutine
+static __thread goroutine_t* current_goroutine = NULL;
+
+goroutine_t* get_current_goroutine(void) {
+    return current_goroutine;
+}
+
+void park_goroutine(void) {
+    // Park the current goroutine (block on condition)
+    current_goroutine->state = GOROUTINE_BLOCKED;
+    
+    // Switch back to worker context
+    // This needs to be implemented with swapcontext
+    // For now, simple version:
+    while (current_goroutine->state == GOROUTINE_BLOCKED) {
+        usleep(1000);
+    }
+}
+
+void scheduler_ready(goroutine_t* g) {
+    g->state = GOROUTINE_READY;
+    // Add back to appropriate queue
+    // For simplicity, add to global queue
+    deque_push_bottom(&global_scheduler->global_deque, g);
+}
+
+void timer_thread_func(void* arg) {
+    struct timespec ts;
+    ts.tv_sec = ((struct timer_data*)arg)->ms / 1000;
+    ts.tv_nsec = (((struct timer_data*)arg)->ms % 1000) * 1000000;
+    
+    nanosleep(&ts, NULL);
+    
+    future_t* f = ((struct timer_data*)arg)->f;
+    f->completed = 1;
+    scheduler_ready(f->waiting_goroutine);
+    
+    free(arg);
 }

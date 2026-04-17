@@ -52,3 +52,8 @@ void scheduler_stealing_wait(scheduler_stealing_t* s);
 void scheduler_stealing_destroy(scheduler_stealing_t* s);
 
 #endif
+// I/O integration
+void scheduler_ready(goroutine_t* g);
+void park_goroutine(void);
+goroutine_t* get_current_goroutine(void);
+void timer_thread_func(void* arg);
