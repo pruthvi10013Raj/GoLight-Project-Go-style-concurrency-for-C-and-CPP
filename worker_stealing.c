@@ -202,6 +202,12 @@ void scheduler_stealing_destroy(scheduler_stealing_t* s) {
 static void* worker_stealing_loop(void* arg) {
     worker_stealing_t* w = (worker_stealing_t*)arg;
     scheduler_stealing_t* s = w->scheduler;
+
+    if (goroutine_thread_init() != 0) {
+        perror("goroutine_thread_init");
+        atomic_store(&s->running, 0);
+        return NULL;
+    }
     
     printf("Worker %d running on CPU %d\n", w->id, sched_getcpu());
     
@@ -300,11 +306,13 @@ static void execute_goroutine_stealing(worker_stealing_t* w, goroutine_t* g) {
     g->return_context = &worker_context;
     g->context.uc_link = &worker_context;
     current_goroutine = g;
+    goroutine_set_active(g);
     current_worker_context = &worker_context;
 
     if (swapcontext(&worker_context, &g->context) == -1) {
         perror("swapcontext");
         current_goroutine = NULL;
+        goroutine_set_active(NULL);
         current_worker_context = NULL;
         atomic_store(&g->state, GOROUTINE_FINISHED);
         atomic_fetch_sub(&w->scheduler->active_goroutines, 1);
@@ -313,6 +321,7 @@ static void execute_goroutine_stealing(worker_stealing_t* w, goroutine_t* g) {
     }
 
     current_goroutine = NULL;
+    goroutine_set_active(NULL);
     current_worker_context = NULL;
 
     int state = atomic_load(&g->state);

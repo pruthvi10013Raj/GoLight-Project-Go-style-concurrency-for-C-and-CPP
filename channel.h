@@ -2,6 +2,9 @@
 #define CHANNEL_H
 
 #include <pthread.h>
+#include <stdatomic.h>
+
+struct goroutine;
 
 typedef struct channel {
     void **buffer;
@@ -9,10 +12,11 @@ typedef struct channel {
     int size;
     int head;
     int tail;
-    
     pthread_mutex_t lock;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
+    struct goroutine *send_waiters;
+    struct goroutine *recv_waiters;
+    atomic_int closed;
+    atomic_int references;
 } channel_t;
 
 // Channel functions

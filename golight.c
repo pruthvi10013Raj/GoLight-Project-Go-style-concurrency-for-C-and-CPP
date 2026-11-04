@@ -95,7 +95,7 @@ int go(void (*function)(void*), void* arg) {
 }
 
 channel_t* make_channel(int capacity) {
-    if (capacity <= 0) {
+    if (capacity < 0) {
         errno = EINVAL;
         return NULL;
     }
