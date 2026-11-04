@@ -4,6 +4,8 @@
 #include <sys/epoll.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 // I/O operation types
 typedef enum {
@@ -15,7 +17,7 @@ typedef enum {
 
 // Future/Promise for async operations
 typedef struct future {
-    int completed;
+    atomic_int completed;
     int result;
     void* data;
     size_t size;

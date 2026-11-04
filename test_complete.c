@@ -1,4 +1,5 @@
 #include "worker_stealing.h"
+#include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <time.h>

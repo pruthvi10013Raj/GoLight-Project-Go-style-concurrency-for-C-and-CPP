@@ -6,26 +6,27 @@
 static int next_id = 1;
 
 static void goroutine_wrapper(goroutine_t *g) {
-    // Run the user's function
     g->function(g->arg);
-    
-    // Mark as finished
-    g->state = GOROUTINE_FINISHED;
-    
-    // IMPORTANT: Return to scheduler
-    // The uc_link we set in execute_goroutine_stealing will take us back
-    // Just return - the context will automatically go to uc_link
+    atomic_store(&g->state, GOROUTINE_FINISHED);
+    if (g->return_context) {
+        if (setcontext(g->return_context) == -1) {
+            perror("setcontext after goroutine completion");
+            abort();
+        }
+    }
 }
 
 goroutine_t* create_goroutine(void (*func)(void*), void *arg) {
-    goroutine_t *g = malloc(sizeof(goroutine_t));
+    goroutine_t * volatile g = malloc(sizeof(goroutine_t));
     if (!g) return NULL;
     
     g->id = next_id++;
     g->function = func;
     g->arg = arg;
-    g->state = GOROUTINE_READY;
-    g->stack_size = 8192;
+    g->worker_id = -1;
+    g->return_context = NULL;
+    atomic_init(&g->state, GOROUTINE_READY);
+    g->stack_size = 64 * 1024;
     g->stack = malloc(g->stack_size);
     
     if (!g->stack) {

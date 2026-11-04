@@ -14,6 +14,7 @@ typedef struct worker_stealing {
     
     // Work-stealing deque
     deque_t deque;
+    pthread_mutex_t deque_lock;
     
     // Statistics
     atomic_int goroutines_executed;
@@ -35,10 +36,12 @@ typedef struct scheduler_stealing {
     
     // Global queue (fallback)
     deque_t global_deque;
+    pthread_mutex_t global_deque_lock;
     
     // Control
     atomic_int running;
     atomic_int active_goroutines;
+    atomic_int next_worker;
     
     // Statistics
     atomic_int total_steals;
@@ -51,9 +54,10 @@ void scheduler_stealing_start(scheduler_stealing_t* s);
 void scheduler_stealing_wait(scheduler_stealing_t* s);
 void scheduler_stealing_destroy(scheduler_stealing_t* s);
 
-#endif
 // I/O integration
 void scheduler_ready(goroutine_t* g);
 void park_goroutine(void);
 goroutine_t* get_current_goroutine(void);
-void timer_thread_func(void* arg);
+int scheduler_yield_current(void);
+
+#endif

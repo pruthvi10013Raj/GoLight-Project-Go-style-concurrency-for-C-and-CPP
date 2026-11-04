@@ -9,7 +9,27 @@
 
 static io_reactor_t reactor;
 static pthread_t reactor_thread;
-static scheduler_stealing_t* global_scheduler = NULL;
+
+typedef struct async_sleep_data {
+    future_t* future;
+    uint64_t milliseconds;
+} async_sleep_data_t;
+
+static void mark_future_complete(future_t* f, int result) {
+    f->result = result;
+    atomic_store_explicit(&f->completed, 1, memory_order_release);
+}
+
+static void* async_sleep_timer(void* arg) {
+    async_sleep_data_t* data = arg;
+    usleep(data->milliseconds * 1000);
+    mark_future_complete(data->future, 0);
+    if (data->future->waiting_goroutine) {
+        scheduler_ready(data->future->waiting_goroutine);
+    }
+    free(data);
+    return NULL;
+}
 
 // Set non-blocking flag on file descriptor
 static int set_nonblocking(int fd) {
@@ -74,6 +94,7 @@ static int register_io(int fd, io_event_t* event, uint32_t events) {
 future_t* async_read(int fd, void* buf, size_t count) {
     future_t* f = calloc(1, sizeof(future_t));
     if (!f) return NULL;
+    atomic_init(&f->completed, 0);
     
     io_event_t* event = calloc(1, sizeof(io_event_t));
     if (!event) {
@@ -88,22 +109,24 @@ future_t* async_read(int fd, void* buf, size_t count) {
     event->count = count;
     
     // Set non-blocking
-    set_nonblocking(fd);
+    if (set_nonblocking(fd) == -1) {
+        mark_future_complete(f, -1);
+        free(event);
+        return f;
+    }
     
     // Try immediate read
     ssize_t n = read(fd, buf, count);
     if (n >= 0) {
         // Data available immediately
-        f->completed = 1;
-        f->result = n;
+        mark_future_complete(f, (int)n);
         free(event);
         return f;
     }
     
     if (errno != EAGAIN && errno != EWOULDBLOCK) {
         // Real error
-        f->completed = 1;
-        f->result = -1;
+        mark_future_complete(f, -1);
         free(event);
         return f;
     }
@@ -113,17 +136,16 @@ future_t* async_read(int fd, void* buf, size_t count) {
     event->future = f;
     
     pthread_mutex_lock(&reactor.lock);
-    
-    // Add to pending reads
+    if (register_io(fd, event, EPOLLIN | EPOLLONESHOT) == -1) {
+        pthread_mutex_unlock(&reactor.lock);
+        mark_future_complete(f, -1);
+        free(event);
+        return f;
+    }
     event->next = reactor.pending_reads;
     reactor.pending_reads = event;
-    
-    // Register with epoll
-    register_io(fd, event, EPOLLIN | EPOLLONESHOT);
-    
     pthread_mutex_unlock(&reactor.lock);
     
-    // Park the goroutine
     park_goroutine();
     
     return f;
@@ -132,6 +154,7 @@ future_t* async_read(int fd, void* buf, size_t count) {
 future_t* async_write(int fd, const void* buf, size_t count) {
     future_t* f = calloc(1, sizeof(future_t));
     if (!f) return NULL;
+    atomic_init(&f->completed, 0);
     
     io_event_t* event = calloc(1, sizeof(io_event_t));
     if (!event) {
@@ -150,15 +173,13 @@ future_t* async_write(int fd, const void* buf, size_t count) {
     // Try immediate write
     ssize_t n = write(fd, buf, count);
     if (n >= 0) {
-        f->completed = 1;
-        f->result = n;
+        mark_future_complete(f, (int)n);
         free(event);
         return f;
     }
     
     if (errno != EAGAIN && errno != EWOULDBLOCK) {
-        f->completed = 1;
-        f->result = -1;
+        mark_future_complete(f, -1);
         free(event);
         return f;
     }
@@ -168,12 +189,14 @@ future_t* async_write(int fd, const void* buf, size_t count) {
     event->future = f;
     
     pthread_mutex_lock(&reactor.lock);
-    
+    if (register_io(fd, event, EPOLLOUT | EPOLLONESHOT) == -1) {
+        pthread_mutex_unlock(&reactor.lock);
+        mark_future_complete(f, -1);
+        free(event);
+        return f;
+    }
     event->next = reactor.pending_writes;
     reactor.pending_writes = event;
-    
-    register_io(fd, event, EPOLLOUT | EPOLLONESHOT);
-    
     pthread_mutex_unlock(&reactor.lock);
     
     park_goroutine();
@@ -184,20 +207,26 @@ future_t* async_write(int fd, const void* buf, size_t count) {
 future_t* async_sleep(uint64_t milliseconds) {
     future_t* f = calloc(1, sizeof(future_t));
     if (!f) return NULL;
-    
+    atomic_init(&f->completed, 0);
     f->waiting_goroutine = get_current_goroutine();
-    
-    // For simplicity, create a timer thread or use timerfd
-    // This is a simplified version
+
+    async_sleep_data_t* data = malloc(sizeof(*data));
+    if (!data) {
+        free(f);
+        return NULL;
+    }
+    data->future = f;
+    data->milliseconds = milliseconds;
+
     pthread_t timer_thread;
-    struct timer_data {
-        future_t* f;
-        uint64_t ms;
-    }* data = malloc(sizeof(*data));
-    data->f = f;
-    data->ms = milliseconds;
-    
-    pthread_create(&timer_thread, NULL, timer_thread_func, data);
+    int error = pthread_create(&timer_thread, NULL, async_sleep_timer, data);
+    if (error != 0) {
+        free(data);
+        free(f);
+        errno = error;
+        perror("pthread_create");
+        return NULL;
+    }
     pthread_detach(timer_thread);
     
     park_goroutine();
@@ -206,6 +235,7 @@ future_t* async_sleep(uint64_t milliseconds) {
 }
 
 void* io_reactor_thread(void* arg) {
+    (void)arg;
     printf("I/O Reactor thread started\n");
     
     while (reactor.running) {
@@ -218,13 +248,13 @@ void* io_reactor_thread(void* arg) {
             // Perform the actual I/O
             if (event->op == IO_READ) {
                 ssize_t n = read(event->fd, event->buffer, event->count);
-                f->result = n;
+                mark_future_complete(f, (int)n);
             } else if (event->op == IO_WRITE) {
                 ssize_t n = write(event->fd, event->buffer, event->count);
-                f->result = n;
+                mark_future_complete(f, (int)n);
+            } else {
+                mark_future_complete(f, -1);
             }
-            
-            f->completed = 1;
             
             // Wake up the waiting goroutine
             if (f->waiting_goroutine) {
@@ -241,14 +271,14 @@ void* io_reactor_thread(void* arg) {
 }
 
 int future_wait(future_t* f) {
-    while (!f->completed) {
+    while (!atomic_load_explicit(&f->completed, memory_order_acquire)) {
         usleep(1000);
     }
     return f->result;
 }
 
 int future_try_wait(future_t* f) {
-    return f->completed;
+    return atomic_load_explicit(&f->completed, memory_order_acquire);
 }
 
 void future_free(future_t* f) {
