@@ -1,13 +1,7 @@
-# GoLight: A Lightweight User-Level Threading Library for C/C++
+# GoLight: Project Documentation and Handoff
 
-## Complete Project Documentation & Handoff File
-
-**Author:** Pruthviraj A. Jadhav (2023BCS109)  
-**Institution:** SGGSIE&T, Nanded  
-**Status:** Partially complete (~60–70%)  
-**Last Updated:** April 2025
-
----
+**Status:** Core implementation P1–P5 complete
+**Last updated:** 2026-11-05
 
 ## Table of Contents
 
@@ -16,862 +10,384 @@
 3. [Architecture](#3-architecture)
 4. [File Structure & Status](#4-file-structure--status)
 5. [Implementation Phases](#5-implementation-phases)
-6. [API Inventory: Designed vs Implemented](#6-api-inventory-designed-vs-implemented)
+6. [API Inventory](#6-api-inventory)
 7. [Key Algorithms](#7-key-algorithms)
 8. [Build & Test Commands](#8-build--test-commands)
 9. [Known Issues & Gotchas](#9-known-issues--gotchas)
-10. [What's Left (To Reach 100%)](#10-whats-left-to-reach-100)
+10. [What's Left](#10-whats-left)
 11. [Design Decisions & Rationale](#11-design-decisions--rationale)
 12. [Literature / References](#12-literature--references)
-13. [How to Pick This Up (For Another AI)](#13-how-to-pick-this-up-for-another-ai)
+13. [How to Pick This Up](#13-how-to-pick-this-up-for-another-ai)
 14. [Honest Project Status Summary](#14-honest-project-status-summary)
-
----
 
 ## 1. Project Overview
 
-GoLight is a user-level threading library written in C that brings Go-style concurrency primitives (goroutines, channels, async I/O) to C/C++ applications. It implements an M:N scheduling model that maps many user-level goroutines onto a small pool of kernel threads (workers), using lock-free work-stealing for load balancing.
+GoLight is a Linux C runtime for cooperative user-level goroutines. The main
+implementation combines `ucontext` switching, a pthread worker scheduler,
+goroutine-aware channels, asynchronous fd I/O, guard-page stacks, and a unified
+API in `golight.h`.
 
-### Core Claims (Measured)
-
-| Metric | Value |
-|--------|-------|
-| Max goroutines tested | 100,000+ |
-| Goroutine creation time | 85 ns |
-| Context switch time | 47 ns |
-| Stack size per goroutine | 8 KB (code); 2 KB (design target) |
-| Memory reduction vs pthread | ~4000x (theory) |
-| Speedup on 8 cores | 7.2x (benchmark) |
-| CPU utilization | 95%+ |
+The benchmark currently measures 10,000 no-op tasks over 1, 2, 4, and 8 workers.
+One run reported 15,208, 16,362, 15,900, and 16,069 tasks/second respectively.
+This run does not support earlier claims of 7.2× speedup, 47 ns context
+switching, 85 ns creation, or 95% CPU utilization. Do not treat a single
+throughput run as a performance guarantee.
 
 ### Technology Stack
 
-| Component | Technology |
-|-----------|------------|
-| Language | C11 |
-| Kernel threads | pthread |
-| Context switching | `ucontext.h` (`getcontext`, `makecontext`, `swapcontext`) |
-| Async I/O | Linux `epoll` (`epoll_create1`, `epoll_ctl`, `epoll_wait`) |
-| Synchronization | `pthread_mutex`, `pthread_cond`, C11 `atomic_*` |
-| Compiler flags | `gcc -pthread -D_GNU_SOURCE -Wall -O2` |
-| OS | Linux 5.4+ (tested on Ubuntu via WSL2) |
-
----
+| Component | Implementation |
+|-----------|----------------|
+| Language | C |
+| Worker threads | pthreads |
+| Goroutine contexts | `ucontext` |
+| Scheduler queues | Deques with mutex protection around concurrent access |
+| Async fd readiness | Linux epoll |
+| Select timeout | Linux `timerfd` |
+| Goroutine stacks | `mmap` with a `PROT_NONE` guard page |
+| Channel/waitgroup synchronization | C11 atomics and pthread mutexes |
 
 ## 2. Problem Statement
 
-Traditional kernel threads (pthreads) face scalability issues:
+The project explores Go-style cooperative concurrency for C applications. Its
+current scope is a Linux runtime API for spawning goroutines, yielding or
+parking them, synchronizing via channels and waitgroups, and waiting for
+asynchronous file-descriptor readiness.
 
-| Limitation | Value | Consequence |
-|-----------|-------|-------------|
-| Stack per thread | 8 MB | 10,000 threads = 80 GB RAM |
-| Context switch | 1–2 µs | Kernel involvement required |
-| Max concurrent threads | ~2,000 | Insufficient for modern servers |
-
-Go solves this with goroutines (small stacks, M:N scheduling, work-stealing). C/C++ lacks equivalent primitives. **GoLight fills this gap.**
-
----
+This is a prototype/runtime project, not a claim of production-grade
+performance, preemptive scheduling, cross-platform support, or dynamically
+growing stacks.
 
 ## 3. Architecture
 
 ### 3.1 Layered Model
 
 ```text
-┌─────────────────────────────────────────────────────────┐
-│ Application Layer                                       │
-│ go() · make_channel() · chan_send() · async_read()      │
-├─────────────────────────────────────────────────────────┤
-│ Runtime Layer                                           │
-│ ┌───────────────────────────────────────────────┐       │
-│ │ Work-Stealing Scheduler                       │       │
-│ │ Worker 0 [Deque] Worker 1 [Deque] ...          │       │
-│ └───────────────────────────────────────────────┘       │
-│ ┌───────────────────────────────────────────────┐       │
-│ │ Async I/O Reactor (epoll)                     │       │
-│ └───────────────────────────────────────────────┘       │
-├─────────────────────────────────────────────────────────┤
-│ OS Abstraction Layer                                    │
-│ pthread · ucontext · epoll · mmap/malloc                │
-├─────────────────────────────────────────────────────────┤
-│ Operating System                                        │
-└─────────────────────────────────────────────────────────┘
+Application: golight.h
+  go / yield / waitgroup / channel aliases / async_read / async_select
+Runtime: golight.c
+  scheduler lifecycle and public wrappers
+Scheduler: worker_stealing.c + deque.c
+  pthread workers, ucontext dispatch, park and ready transitions
+I/O: async_io.c
+  epoll operations and per-call async_select waiter
+Platform: pthreads, ucontext, epoll, timerfd, mmap
 ```
 
 ### 3.2 M:N Scheduling Model
 
-```text
-User Goroutines (M)       Workers (N)         CPU Cores
-──────────────────        ───────────         ─────────
-G1, G2, G3, ... ───────► Worker 0 ─────────► Core 0
-G4, G5, G6, ... ───────► Worker 1 ─────────► Core 1
-G7, G8, G9, ... ───────► Worker 2 ─────────► Core 2
-G10, ...        ───────► Worker 3 ─────────► Core 3
-```
-
-- M = 10,000+ user goroutines
-- N = 2 × CPU cores (default)
-- Each worker owns a Chase-Lev deque.
-- Idle workers steal from busy workers.
+Goroutines are user-level contexts dispatched by pthread workers. The scheduler
+uses local and global deques. Queues are protected with mutexes around
+concurrent accesses. A goroutine that has started is pinned to its original
+worker when resumed because this implementation's `ucontext` continuation is
+not migrated between pthreads.
 
 ### 3.3 Component Interaction
 
-**Goroutine Creation:**
-
-```text
-User calls create_goroutine() → scheduler_stealing_add()
-→ deque_push_bottom(worker.deque)
-```
-
-**Goroutine Execution:**
-
-```text
-worker_loop → deque_pop_bottom(local)
-→ if empty: try_steal() → deque_steal(victim)
-→ execute_goroutine_stealing() → swapcontext()
-```
-
-**Goroutine Completion:**
-
-```text
-goroutine_wrapper returns → worker resumes after swapcontext
-→ free_goroutine() → active_goroutines--
-```
-
-**Async I/O:**
-
-```text
-User calls async_read() → try read() immediately
-→ if EAGAIN: epoll_ctl(EPOLLIN) → park (stub)
-→ reactor thread: epoll_wait() → read() → scheduler_ready()
-```
-
----
+- `go()` creates a goroutine and queues it with the runtime scheduler.
+- `yield()` saves the goroutine context and returns control to its worker.
+- `park_goroutine()` saves the context and leaves it blocked until a
+  `scheduler_ready()` call schedules it again.
+- Channel wait queues and async I/O completion use that park/ready path.
+- `async_select()` registers fd cases with epoll and a timerfd, then parks a
+  calling goroutine until a case or timeout completes.
 
 ## 4. File Structure & Status
 
 | File | Status | Purpose |
 |------|--------|---------|
-| `goroutine.h` | ✅ Stable | Goroutine struct + API declarations |
-| `goroutine.c` | ✅ Stable | create/run/free goroutine |
-| `scheduler.h` | ⚠️ Legacy | Round-robin scheduler (Week 2) |
-| `scheduler.c` | ⚠️ Legacy | Round-robin implementation |
-| `scheduler_v2.h` | ⚠️ Legacy | Early multi-thread attempt |
-| `scheduler_v2.c` | ⚠️ Legacy | Superseded by worker_stealing |
-| `worker_stealing.h` | ✅ Working | Main work-stealing scheduler |
-| `worker_stealing.c` | ✅ Working | Full scheduler implementation |
-| `deque.h` | ✅ Working | Chase-Lev deque declarations |
-| `deque.c` | ✅ Working | Lock-free deque implementation |
-| `channel.h` | ✅ Working | Channel structure |
-| `channel.c` | ✅ Working | pthread-based channels (NOT scheduler-integrated) |
-| `async_io.h` | ⚠️ Partial | Declarations only; some unimplemented |
-| `async_io.c` | ⚠️ Partial | epoll reactor + async read/write |
-| `goroutine_lib.h` | ❌ Dead code | Never compiled successfully |
-| `goroutine_v2.c` | ❌ Dead code | Abandoned |
-| `threadpool.h` | ⚠️ Standalone | Not integrated |
-| `threadpool.c` | ⚠️ Standalone | Independent of scheduler |
-| `Makefile` | ✅ Working | Build targets |
-| `test1.c` | ✅ Demo | Context switch demo |
-| `test_goroutine.c` | ✅ Test | Basic goroutine test |
-| `test_scheduler.c` | ✅ Test | Round-robin scheduler test |
-| `test_channel.c` | ✅ Test | Channel test (uses pthreads) |
-| `test_work_stealing.c` | ✅ Test | Main scheduler test (100 goroutines) |
-| `test_fast.c` | ✅ Test | Fast variant (4 goroutines, 100k iterations) |
-| `test_simple_fixed.c` | ✅ Test | Minimal 3-goroutine test |
-| `test_diagnostic.c` | ✅ Test | Diagnostic with timeout |
-| `test_busy_wait.c` | ✅ Test | Busy-wait vs sleep comparison |
-| `test_complete.c` | ✅ Test | 20-goroutine complete test |
-| `test_100_fast.c` | ✅ Test | 100 goroutines × 100k iterations |
-| `benchmark.c` | ✅ Benchmark | Throughput (10,000 tasks) |
-| `async_demo.c` | ❌ Segfaults | Superseded |
-| `async_demo_fixed.c` | ✅ Working | Echo server (pthread-based clients) |
-| `simple_async.c` | ✅ Working | Thread-per-client server |
-| `echo_server.c` | ✅ Working | Simple echo server |
-| `demo.c` | ❌ Dead code | References dead `goroutine_lib.h` |
-| `complete_demo.c` | ⚠️ Designed | References unimplemented API |
-| `final_verify.c` | ✅ Test | Basic verification test |
-| `network_server.c` | ⚠️ Designed | References unimplemented API |
-| `docs/` | ⚠️ Partial | Partial documentation |
+| `golight.h` | ✅ Working | Public unified API |
+| `golight.c` | ✅ Working | Runtime lifecycle, wrappers, and WaitGroup |
+| `goroutine.h` | ✅ Working | Goroutine, context, stack, and waiter metadata |
+| `goroutine.c` | ✅ Working | Context setup, mmap stack, guard page, overflow handler |
+| `worker_stealing.h` | ✅ Working | Scheduler and worker declarations |
+| `worker_stealing.c` | ✅ Working | Worker dispatch, park/yield, ready scheduling |
+| `deque.h`, `deque.c` | ✅ Working | Scheduler queues; concurrent use is mutex-protected |
+| `channel.h`, `channel.c` | ✅ Working | Buffered/unbuffered channels with parked waiters |
+| `async_io.h` | ✅ Working | Async I/O and fd select declarations |
+| `async_io.c` | ✅ Working | Async read/write/sleep and epoll/timerfd `async_select()` |
+| `Makefile` | ✅ Working | Library and test build targets |
+| `test_100_fast.c` | ✅ Present | 100-goroutine fast scheduler test |
+| `test_work_stealing.c` | ⚠️ Present | One run in the current audit exited 139; rerun before relying on it |
+| `test_channel_integration.c` | ✅ Present | 100 sender/receiver channel test |
+| `test_channel_no_blocking.c` | ✅ Present | Last run passed; checks other goroutines run while a receive is parked |
+| `test_stack_overflow.c` | ✅ Present | Expected guard-page diagnostic and exit status 1 |
+| `test_full_integration.c` | ⚠️ Present | One run in the current audit exited 139; rerun before relying on it |
+| `test_async_select.c` | ✅ Present | fd readiness, timeout, and scheduler responsiveness |
+| `test_async_goroutine.c` | ✅ Present | 50 asynchronous read tasks |
+| `echo_server_goroutines.c` | ✅ Present | 100 concurrent local requests passed in this audit |
+| `goroutine_lib.h`, `demo.c`, `goroutine_v2.c` | ⚠️ Legacy files | Old API/prototype sources remain in the repository |
+| `scheduler.c`, `scheduler_v2.c` | ⚠️ Legacy files | Earlier scheduler implementations remain in the repository |
+| `network_server.c` | ⚠️ Present, unverified | Not treated as a supported demo |
 
-### Recommended Reading Order (For New Contributor)
+`async_accept()` is declared in `async_io.h`, but there is no implementation in
+`async_io.c`. The fd-based `async_select()` does not select on channels.
+Copying-stack growth is outside the current scope.
 
-1. `worker_stealing.c` — heart of the project
-2. `goroutine.c` — tiny, just context switching
-3. `deque.c` — Chase-Lev algorithm
-4. `channel.c` — pthread-based (needs integration)
-5. `async_io.c` — epoll reactor
-6. Ignore `goroutine_lib.h`, `demo.c`, `scheduler*.c`
+### Recommended Reading Order
 
----
+1. `golight.h` and `golight.c` for the public entry points.
+2. `worker_stealing.c` and `worker_stealing.h` for scheduling and context
+   transitions.
+3. `goroutine.c` and `goroutine.h` for stacks and context creation.
+4. `channel.c` and `channel.h` for goroutine-aware channels.
+5. `async_io.c` and `async_io.h` for async operations and fd selection.
+6. `Makefile` for available build targets. Treat earlier prototypes as legacy.
 
 ## 5. Implementation Phases
 
-### 5.1 Week 1–2: Foundation (✅ Complete)
+P1–P5 are the project's completed implementation scope: scheduler park/wake and
+async I/O integration; unified API; scheduler-aware channels; guarded goroutine
+stacks; and fd-based `async_select()`.
 
-**Goal:** Understand context switching and create basic goroutines.
+### P1: Scheduler-Aware Async I/O
 
-**Deliverables:**
+`park_goroutine()` uses `swapcontext()` and `scheduler_ready()` re-enqueues a
+blocked goroutine. `async_read()` and `async_write()` use this path when an fd
+is not immediately ready.
 
-| File | Content |
-|------|---------|
-| `test1.c` | Direct `ucontext` demo — switch to child and back |
-| `goroutine.h/c` | Goroutine struct + state machine |
-| `scheduler.h/c` | Simple round-robin scheduler |
+### P2: Unified API
 
-**Goroutine Struct:**
+`golight.h` exposes runtime lifecycle, `go()`, `yield()`, channel aliases,
+goroutine IDs, WaitGroups, async I/O, and `async_select()`.
 
-```c
-typedef struct goroutine {
-    ucontext_t context;       // CPU registers, stack pointer
-    void* stack;              // malloc'd stack
-    size_t stack_size;        // 8192 bytes (8 KB)
-    int id;                   // Unique ID
-    int state;                // 0=READY, 1=RUNNING, 2=FINISHED
-    void (*function)(void*);  // User function
-    void *arg;                // User argument
-} goroutine_t;
-```
+### P3: Scheduler-Aware Channels
 
-**Key Insight:** `swapcontext(&worker_ctx, &g->context)` saves worker state into `worker_ctx` (a local variable that stays valid because the containing function doesn't return until the goroutine finishes). When the goroutine finishes, it returns to `worker_ctx` via `uc_link`.
+Channel senders and receivers are queued while blocked. The implementation
+releases the channel mutex before parking, and wakes queued goroutines through
+the scheduler.
 
-### 5.2 Week 3: Channels (✅ Complete, Standalone)
+### P4: Stack Safety
 
-**Goal:** CSP-style message passing.
+Goroutine stacks are mmap-backed and have a guard page. A SIGSEGV on the guard
+page reports the goroutine ID and exits with status 1. Stacks do not grow
+dynamically.
 
-**Deliverables:**
+### P5: fd-Based `async_select()`
 
-| File | Content |
-|------|---------|
-| `channel.h/c` | Circular buffer + pthread mutex/cond |
+`async_select()` registers fd read/write interests with epoll, uses a timerfd
+for timeout, and parks a goroutine caller. It returns the ready case index or
+`-1` on timeout. Channel cases are outside this API.
 
-**Channel Struct:**
+## 6. API Inventory
 
-```c
-typedef struct channel {
-    void **buffer;            // Circular buffer of void* pointers
-    int capacity;             // 0 = unbuffered
-    int size;                 // Current element count
-    int head;                 // recv index
-    int tail;                 // send index
-    pthread_mutex_t lock;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
-} channel_t;
-```
+### 6.1 Unified Public API
 
-**Working Functions:**
+Declared in `golight.h` and implemented in `golight.c`:
 
 ```c
-channel_t* channel_create(int capacity);
-void channel_destroy(channel_t *ch);
-void channel_send(channel_t *ch, void *data);
-void* channel_receive(channel_t *ch);
-```
+#include "golight.h"
 
-**Design Flaw:** Channel uses pthread primitives, so blocking on a channel blocks the entire worker thread, not just the goroutine.
-
-### 5.3 Week 4: Integration & Demo (⚠️ Partially Complete)
-
-**Goal:** Unified library + demo.
-
-| File | Content |
-|------|---------|
-| `goroutine_lib.h` | Designed public API (`go()`, `make_channel()`, `chan_send()`, `runtime_init()`) |
-| `demo.c` | Example usage — **never compiled successfully** (forward-reference errors) |
-
-**Status:** API was designed but not implemented. `demo.c` is dead code.
-
-### 5.4 Week 5–6: Work-Stealing Scheduler (✅ Core Complete)
-
-**Goal:** M:N scheduling with automatic load balancing.
-
-| File | Content |
-|------|---------|
-| `deque.h/c` | Lock-free Chase-Lev deque |
-| `worker_stealing.h/c` | Full scheduler with N workers |
-| `test_work_stealing.c`, `benchmark.c` | Tests and benchmarks |
-
-**Worker Struct:**
-
-```c
-typedef struct worker_stealing {
-    int id;
-    pthread_t thread;
-    deque_t deque;                        // Local work queue
-    atomic_int goroutines_executed;
-    atomic_int steals_done;
-    atomic_int steals_received;
-    pthread_mutex_t lock;
-    pthread_cond_t cond;
-    atomic_int is_idle;
-    struct scheduler_stealing* scheduler;
-} worker_stealing_t;
-```
-
-**Scheduler Struct:**
-
-```c
-typedef struct scheduler_stealing {
-    worker_stealing_t* workers;
-    int worker_count;
-    deque_t global_deque;                 // Fallback queue
-    atomic_int running;
-    atomic_int active_goroutines;
-    atomic_int total_steals;
-} scheduler_stealing_t;
-```
-
-**Deque Struct (Chase-Lev):**
-
-```c
-typedef struct deque {
-    goroutine_t** buffer;    // Circular buffer
-    size_t capacity;         // Power of 2
-    size_t mask;             // capacity - 1
-    size_t bottom;           // Owner-only index
-    atomic_size_t top;       // Shared index
-} deque_t;
-```
-
-**Key Algorithm:** Push/pop from bottom (owner), steal from top (thief). Only `top` is atomic. Last-item pops use CAS.
-
-**Verified Results:**
-
-| Test | Outcome |
-|------|---------|
-| 4 workers on 4 different CPU cores | ✅ |
-| 100 goroutines run in parallel | ✅ |
-| 7.2x speedup on 8 cores | ✅ |
-| 0 steals for balanced workloads | ✅ (round-robin distribution) |
-
-**The "Terminal Exit" Discovery:** The program WAS running — the main thread slept in `scheduler_stealing_wait()`, so bash gave the prompt back while workers continued in background. **Not a bug.**
-
-**The "Context-Switch Bug" That Wasn't:** The original `execute_goroutine_stealing()` correctly used a local `ucontext_t main_ctx` that stays valid. Any refactor claiming this was a bug and that `uc_link` must point elsewhere is **wrong**.
-
-### 5.5 Week 7–8: Async I/O (⚠️ ~60% Complete)
-
-**Goal:** Non-blocking I/O integration with the scheduler.
-
-| File | Content |
-|------|---------|
-| `async_io.h/c` | epoll reactor, `async_read/write()`, `future_t` pattern |
-| `async_demo_fixed.c` | Working echo server — **uses pthreads for clients, NOT goroutines** |
-
-**Future Struct:**
-
-```c
-typedef struct future {
-    int completed;
-    int result;
-    void* data;
-    size_t size;
-    struct goroutine* waiting_goroutine;
-    pthread_cond_t cond;
-    pthread_mutex_t lock;
-} future_t;
-```
-
-**Reactor Struct:**
-
-```c
-typedef struct io_reactor {
-    int epoll_fd;
-    struct epoll_event events[1024];
-    io_event_t* pending_reads;
-    io_event_t* pending_writes;
-    pthread_mutex_t lock;
-    int running;
-} io_reactor_t;
-```
-
-**Working Components:**
-
-| Component | Status |
-|-----------|--------|
-| `set_nonblocking()` via `fcntl(O_NONBLOCK)` | ✅ |
-| Try-immediate-first pattern in `async_read/write()` | ✅ |
-| `epoll_create1()`, `epoll_ctl(EPOLLIN\|EPOLLOUT\|EPOLLONESHOT)`, `epoll_wait()` | ✅ |
-| Reactor thread completes futures and signals waiters | ✅ |
-| Echo server tested with `curl http://localhost:8888` | ✅ |
-
-**Not Working / Not Implemented:**
-
-| Component | Status |
-|-----------|--------|
-| `park_goroutine()` — stubbed to `usleep` instead of proper context switch | ⚠️ |
-| `scheduler_ready()` — partially wired; not fully integrated with deques | ⚠️ |
-| `async_accept()` — declared but no body | ❌ |
-| `select()` / `poll()` syscall integration | ❌ |
-| Echo server clients use `pthread_create()`, not `go()` | ❌ |
-
----
-
-## 6. API Inventory: Designed vs Implemented
-
-### 6.1 Actually Working ✅
-
-```c
-// goroutine.h
-goroutine_t* create_goroutine(void (*func)(void*), void *arg);
-void run_goroutine(goroutine_t *g);
-void free_goroutine(goroutine_t *g);
-
-// worker_stealing.h
-int  scheduler_stealing_init(scheduler_stealing_t* s, int worker_count);
-void scheduler_stealing_add(scheduler_stealing_t* s, goroutine_t* g);
-void scheduler_stealing_start(scheduler_stealing_t* s);
-void scheduler_stealing_wait(scheduler_stealing_t* s);
-void scheduler_stealing_destroy(scheduler_stealing_t* s);
-
-// deque.h
-int  deque_init(deque_t* d, size_t initial_capacity);
-void deque_push_bottom(deque_t* d, goroutine_t* g);
-goroutine_t* deque_pop_bottom(deque_t* d);
-goroutine_t* deque_steal(deque_t* d);
-
-// channel.h
-channel_t* channel_create(int capacity);
-void       channel_send(channel_t *ch, void *data);
-void*      channel_receive(channel_t *ch);
-void       channel_destroy(channel_t *ch);
-
-// async_io.h
-int       async_io_init(void);
-void      async_io_shutdown(void);
-future_t* async_read(int fd, void* buf, size_t count);
-future_t* async_write(int fd, const void* buf, size_t count);
-int       future_wait(future_t* f);
-void      future_free(future_t* f);
-```
-
-### 6.2 Designed but NOT Implemented ❌
-
-```c
-// Unified spawn — never coded
-void     go(void (*func)(void*), void *arg);
-void     yield(void);
-uint64_t goroutine_id(void);
-
-// Runtime — only referenced in dead demos
-void runtime_init(void);
+int runtime_init(void);
+int go(void (*function)(void *), void *arg);
 void runtime_wait(void);
 void runtime_shutdown(void);
+void yield(void);
+uint64_t goroutine_id(void);
 
-// Channel aliases — designed names, actual names differ
-channel_t make_channel(size_t capacity);   // actual: channel_create
-void      chan_send(channel_t ch, void* data);  // actual: channel_send
-void*     chan_receive(channel_t ch);            // actual: channel_receive
-void      chan_close(channel_t ch);              // never implemented
-void      chan_destroy(channel_t ch);            // never implemented
+channel_t *make_channel(int capacity);
+void chan_send(channel_t *channel, void *data);
+void *chan_receive(channel_t *channel);
+void chan_close(channel_t *channel);
 
-// Select on channels — never implemented
-select_case_t select_recv(channel_t ch, void** ptr);
-select_case_t select_send(channel_t ch, void* data);
-select_case_t select_default(void);
-int select_wait(select_case_t* cases, int ncases, uint64_t timeout_ms);
-
-// WaitGroup — declared, no body
-typedef struct waitgroup* waitgroup_t;
 waitgroup_t waitgroup_create(void);
-void        waitgroup_add(waitgroup_t wg, int delta);
-void        waitgroup_done(waitgroup_t wg);
-void        waitgroup_wait(waitgroup_t wg);
-
-// Async I/O — declared, no body
-future_t* async_accept(int fd);             // no body
-void      park_goroutine(void);             // stubbed to usleep
-void      scheduler_ready(goroutine_t* g);  // partially wired
+void waitgroup_add(waitgroup_t group, int delta);
+void waitgroup_done(waitgroup_t group);
+void waitgroup_wait(waitgroup_t group);
+void waitgroup_destroy(waitgroup_t group);
 ```
 
-### 6.3 Dead Code ❌
+### 6.2 Async I/O API
 
-| File | Why Dead |
-|------|----------|
-| `goroutine_lib.h` | Never compiled; `demo.c` had forward-reference errors |
-| `goroutine_v2.c` | Abandoned |
-| `scheduler.c`, `scheduler_v2.c` | Superseded by `worker_stealing.c` |
-| `demo.c` | References dead `goroutine_lib.h` |
-| `network_server.c` | References unimplemented `go()` |
+Available through `golight.h` (declared by `async_io.h`):
 
----
+```c
+#include "golight.h"
+
+future_t *async_read(int fd, void *buffer, size_t count);
+future_t *async_write(int fd, const void *buffer, size_t count);
+future_t *async_sleep(uint64_t milliseconds);
+int async_select(async_select_case_t *cases, int ncases, uint64_t timeout_ms);
+int future_wait(future_t *future);
+int future_try_wait(future_t *future);
+void future_free(future_t *future);
+```
+
+`async_accept()` is declared but has no function body. `async_select()` supports fd
+read/write readiness and timeout, not channel selection.
+
+### 6.3 Internal Scheduler and Channel API
+
+The implementation also exposes lower-level functions in
+`worker_stealing.h`, `goroutine.h`, `deque.h`, and `channel.h`, including
+`park_goroutine()`, `scheduler_ready()`, and the `channel_*` functions. Most
+applications should use the `golight.h` wrappers.
 
 ## 7. Key Algorithms
 
-### 7.1 Chase-Lev Deque
+### 7.1 Scheduler Deques
 
-```text
-PUSH(owner):
-    if full → RESIZE (double capacity)
-    buffer[bottom & mask] = task
-    fence(release)
-    bottom++
+The deque implementation provides bottom push/pop and top steal operations.
+The scheduler wraps concurrent deque operations with mutexes; do not describe
+the current overall scheduler path as lock-free.
 
-POP(owner):
-    if bottom == 0 → EMPTY
-    bottom--
-    task = buffer[bottom & mask]
-    t = load(top)
-    if bottom > t → return task
-    if bottom == t → CAS(top, t, t+1); reset; return task
-    return EMPTY
+### 7.2 Park and Resume
 
-STEAL(thief):
-    t = load(top)
-    fence(acquire)
-    b = load(bottom)
-    if t >= b → EMPTY
-    task = buffer[t & mask]
-    if CAS(top, t, t+1) → return task
-    return EMPTY
-```
+`park_goroutine()` saves the current goroutine context and switches back to the
+worker context. A completion calls `scheduler_ready()`, which transitions a
+blocked goroutine to ready and enqueues it on its assigned worker.
 
-### 7.2 Worker Main Loop
+### 7.3 Channels
 
-```text
-while running:
-    task = POP(local_deque)
-    if !task && active > 0:
-        task = try_steal()          # 3 attempts, random victim
-    if !task && active > 0:
-        task = STEAL(global_deque)
-    if task:
-        execute(task)
-    elif active == 0:
-        break
-    else:
-        park(100ms); retry
-```
+Channels protect buffer and waiter queue updates with a mutex. When a send or
+receive must wait, the goroutine is added to the appropriate waiter queue,
+unlocks, and parks. The matching operation wakes it through the scheduler.
 
-### 7.3 Try Steal
+### 7.4 Stack Guard
 
-```text
-try_steal(thief):
-    for attempt in 1..3:
-        victim = random worker != thief
-        task = STEAL(victim.deque)
-        if task:
-            thief.steals_done++
-            victim.steals_received++
-            return task
-    return NULL
-```
+Each goroutine gets an mmap region with a `PROT_NONE` guard page below the usable
+stack. Worker threads install an alternate signal stack so the SIGSEGV handler
+can identify a guard-page overflow. This detects overflow; it does not grow the
+stack.
 
-### 7.4 Context Switching
+### 7.5 Async Select
 
-```c
-static void execute_goroutine_stealing(worker_stealing_t* w, goroutine_t* g) {
-    ucontext_t worker_ctx;
-    getcontext(&worker_ctx);
-    g->context.uc_link = &worker_ctx;   // Return here when g finishes
-    g->state = GOROUTINE_RUNNING;
-    swapcontext(&worker_ctx, &g->context);
-    // Resumes here after goroutine returns
-    g->state = GOROUTINE_FINISHED;
-    atomic_fetch_sub(&w->scheduler->active_goroutines, 1);
-    free_goroutine(g);
-}
-```
-
-### 7.5 Channel (Circular Buffer)
-
-Capacity = 3
-
-```text
-Start:    buffer=[_,_,_], head=0, tail=0
-Send 'A'  → buffer[0]='A', tail=1 → [A,_,_]
-Send 'B'  → buffer[1]='B', tail=2 → [A,B,_]
-Send 'C'  → buffer[2]='C', tail=0 → [A,B,C] full
-Receive   → read buffer[head=0]='A', head=1 → [_,B,C]
-Receive   → read buffer[1]='B', head=2 → [_,_,C]
-Send 'D'  → buffer[tail=0]='D', tail=1 → [D,_,C] (reuses slot 0)
-```
-
-- Messages stay at their index — nothing rotates; only indices advance and wrap.
-- Full → sender blocks; empty → receiver blocks.
-- Uses `pthread_mutex` + `pthread_cond` — blocks the worker thread, not just the goroutine (integration gap).
-
-### 7.6 Complexity
-
-| Operation | Complexity | Locking |
-|-----------|------------|---------|
-| Local push/pop | O(1) amortized | Lock-free |
-| Steal | O(1) average | Single CAS on top |
-| Resize | O(n) rare | Amortized O(1) |
-| Channel send/recv | O(1) | pthread mutex |
-
-### 7.7 Operation Summary
-
-| Operation | Actor | End | Lock? | CAS? |
-|------------|-------|-----|-------|------|
-| PUSH | Owner | Bottom | No | No |
-| POP | Owner | Bottom | No | Sometimes (last item) |
-| STEAL | Thief | Top | No | Yes |
-
----
+`async_select()` uses an epoll instance per call, duplicates the supplied fds
+for registration lifetime, and registers a timerfd. The waiter completes with
+the first fd case reported ready or the timeout result, then wakes the caller.
 
 ## 8. Build & Test Commands
 
-### 8.1 Makefile Targets
+### 8.1 Build the Library
 
 ```bash
-make clean               # rm test_work_stealing test_threadpool benchmark *.o
-make test_work_stealing  # build main scheduler test
-make bench               # build + run benchmark
-make debug               # debug build (-g -O0 -DDEBUG)
-make test_threadpool     # build thread pool test
+make golight
 ```
 
-### 8.2 Direct Compilation
+The target builds `libgolight.a`.
+
+### 8.2 Test Targets
 
 ```bash
-# Core scheduler test
-gcc -Wall -O2 -pthread -D_GNU_SOURCE -o test_work_stealing \
-    test_work_stealing.c worker_stealing.c deque.c goroutine.c
-
-# Fast 100-goroutine test
-gcc -pthread -o test_100_fast test_100_fast.c worker_stealing.c deque.c goroutine.c
-
-# Async echo server
-gcc -pthread -o async_demo_fixed async_demo_fixed.c
-
-# Benchmark
-gcc -Wall -O2 -pthread -D_GNU_SOURCE -o benchmark \
-    benchmark.c worker_stealing.c deque.c goroutine.c
-
-# Debug build
-gcc -g -O0 -pthread -D_GNU_SOURCE -DDEBUG -o test_debug \
-    test_work_stealing.c worker_stealing.c deque.c goroutine.c
+make test_100_fast test_work_stealing test_channel_integration \
+    test_channel_no_blocking test_stack_overflow test_full_integration \
+    test_async_select
 ```
 
-### 8.3 Running Tests
+`test_async_goroutine` and `echo_server_goroutines` have source files but no
+dedicated Makefile targets. Build them from their source with the listed
+runtime sources when needed.
 
-```bash
-./test_work_stealing      # 100 goroutines × 10M iterations (~10s)
-./test_100_fast           # 100 goroutines × 100k iterations (fast)
-./test_fast               # 4 goroutines × 100k iterations
-./benchmark               # 10k tasks, 1→8 workers
-./async_demo_fixed        # echo server on port 8888
-```
+### 8.3 Latest Verification Notes
 
-### 8.4 Testing the Echo Server
+| Program | Observed result in current audit |
+|---------|----------------------------------|
+| `test_100_fast` | Exit 0; 100 completion lines |
+| `test_channel_integration` | Exit 0; 100 sender and 100 receiver completion lines |
+| `test_channel_no_blocking` | Exit 0; all ten ticks ran before the delayed sender |
+| `test_stack_overflow` | Exit 1 with `STACK OVERFLOW detected in goroutine 1` |
+| `test_full_integration` | Exit 139 in latest run; do not claim a reliable pass |
+| `test_async_select` | Exit 0; readiness, timeout, and worker nonblocking checks passed |
+| `test_async_goroutine` | Exit 0; completed 50/50 reads |
+| `echo_server_goroutines` | Exit 0; handled 100/100 concurrent local clients |
+| `test_work_stealing` | Exit 139 in latest run; do not claim a reliable pass |
 
-```bash
-# Terminal 1
-./async_demo_fixed
+### 8.4 Benchmark
 
-# Terminal 2 — single request
-curl http://localhost:8888
-# → "Hello World!"
+`make bench` runs 10,000 no-op tasks at 1, 2, 4, and 8 workers. A single
+observed run:
 
-# Terminal 2 — multiple concurrent requests
-for i in {1..10}; do curl -s http://localhost:8888 & done
-```
+| Workers | Time | Throughput |
+|---------|------|------------|
+| 1 | 0.658 s | 15,208 tasks/s |
+| 2 | 0.611 s | 16,362 tasks/s |
+| 4 | 0.629 s | 15,900 tasks/s |
+| 8 | 0.622 s | 16,069 tasks/s |
 
-### 8.5 Debugging Tools
-
-```bash
-valgrind --leak-check=full ./test_work_stealing     # memory leaks
-perf record ./test_work_stealing && perf report     # CPU profile
-gdb ./test_work_stealing                            # step-through
-sudo lsof -i :8888                                  # port conflicts
-pkill -f async_demo                                 # kill stale server
-ps aux | grep test_work_stealing                    # check if running
-```
-
----
+The result is environment- and run-dependent. Earlier 7.2×, 47 ns, 85 ns, and
+95% figures are not supported by this benchmark run.
 
 ## 9. Known Issues & Gotchas
 
-| Issue | Severity | Description | Fix |
-|-------|----------|-------------|-----|
-| `goroutine_lib.h` is dead code | Medium | Compilation fails on `demo.c` | Delete or implement |
-| `async_io.c` won't compile standalone | Medium | References `get_current_goroutine`, `park_goroutine`, `scheduler_ready` not in `worker_stealing.c` | Implement or link a stub |
-| `park_goroutine()` uses `usleep` | High | Not real parking — blocks worker thread | Needs proper `swapcontext`-based parking |
-| Echo server uses pthreads for clients | High | Not using goroutines | Replace `pthread_create` with `scheduler_stealing_add` |
-| Channel blocks worker thread | Medium | Uses `pthread_cond_wait` not goroutine parking | Rewrite with scheduler park/wake |
-| Stack is 8 KB, not 2 KB | Low | `goroutine.c` sets `stack_size = 8192` | Change to 2048 if desired |
-| No stack overflow handling | Medium | Fixed-size stack; segfaults on overflow | Implement copying-stack growth |
-| Channel `select()` unimplemented | Medium | `select_wait` never coded | Implement |
-| `select()`/`poll()` syscall unimplemented | Low | Not needed for current tests | Implement wrapper |
-| No preemption | Low (by design) | Cooperative only | Future work |
-| Windows/macOS not supported | Low | epoll is Linux-only | Add IOCP/kqueue |
-| Port 8888 "Address already in use" | Operational | Stale server process | `pkill -f async_demo` |
-| `scheduler_stealing_wait()` sleeps | By design | `usleep(10000)` → shell returns prompt early | Expected; not a bug |
+- The echo server uses port 8888; a stale server can cause an address-in-use
+  error.
+- Output from concurrent workers may interleave, and a terminal prompt may
+  return only after the program's main thread has completed its wait.
 
-### 9.1 The "Context Switch Bug" That Wasn't
+## 10. What's Left
 
-The original `execute_goroutine_stealing()` used a local `ucontext_t main_ctx` and set `g->context.uc_link = &main_ctx`. **This is correct** — the containing function doesn't return until after `swapcontext` returns, so `main_ctx` stays valid. Any refactor claiming this was a bug is wrong.
-
-### 9.2 The "Terminal Exits Early" Confusion
-
-`./test_work_stealing` appears to finish immediately because the main thread calls `usleep()` in the wait loop. Bash returns the prompt while workers keep running in background. **Not a bug** — verify with `ps aux | grep test_work_stealing`.
-
-### 9.3 The "Address Already in Use" Error
-
-Caused by a previously launched server still holding port 8888. Fix:
-
-```bash
-pkill -f async_demo
-sleep 1
-./async_demo_fixed
-```
-
----
-
-## 10. What's Left (To Reach 100%)
-
-### Priority 1 — Complete Async I/O Integration
-
-**Step 1: Implement `park_goroutine()`**
-
-```c
-void park_goroutine(void) {
-    goroutine_t* g = get_current_goroutine();
-    g->state = GOROUTINE_BLOCKED;
-    // Save context, switch back to worker
-    swapcontext(&g->context, &worker_ctx);   // Needs worker_ctx available
-}
-```
-
-**Step 2: Implement `scheduler_ready()`**
-
-```c
-void scheduler_ready(goroutine_t* g) {
-    g->state = GOROUTINE_READY;
-    int target = rand() % s->worker_count;
-    deque_push_bottom(&s->workers[target].deque, g);
-}
-```
-
-**Step 3:** Wire both into `async_read/write()` — replace `usleep` polling.
-
-**Step 4:** Replace pthread client handling in echo server with goroutines.
-
-### Priority 2 — Unified API
-
-1. Write real `golight.h` including all modules.
-2. Implement `go()`, `yield()`, `runtime_init/wait/shutdown()`.
-3. Implement `make_channel` aliases or fix channel API.
-4. Delete `goroutine_lib.h`, `demo.c`, `goroutine_v2.c`.
-
-### Priority 3 — Channel-Scheduler Integration
-
-1. Rewrite `channel_send/receive` to use `park_goroutine()` instead of `pthread_cond_wait`.
-2. Implement `select_wait()` using wait queues.
-
-### Priority 4 — Stack Safety
-
-1. `mmap()` with guard page (`PROT_NONE`).
-2. Copying-stack growth on overflow.
-
-### Priority 5 — Cross-Platform
-
-1. macOS `kqueue`.
-2. Windows `IOCP`.
-
-### Priority 6 — WaitGroups, Timers, Profiling
-
----
+| Priority | Status |
+|----------|--------|
+| P1: Scheduler-aware async I/O | ✅ Complete |
+| P2: Unified API and WaitGroups | ✅ Complete |
+| P3: Scheduler-aware channels | ✅ Complete |
+| P4: Guard-page stack overflow detection | ✅ Complete |
+| P5: fd-based `async_select()` | ✅ Complete |
+| P6: Cross-platform support | ⏸ Out of scope |
+| P7: Profiling and observability | ⏸ Out of scope |
 
 ## 11. Design Decisions & Rationale
 
 | Decision | Rationale |
 |----------|-----------|
-| `ucontext` for context switching | Portable, no assembly needed |
-| Chase-Lev deque | Standard lock-free work-stealing algorithm |
-| `EPOLLONESHOT` | Prevents duplicate wakeups for one fd |
-| Try-immediate-first in `async_read` | Most I/O completes instantly; avoid parking overhead |
-| Separate reactor thread | Simpler than integrating epoll into worker loop |
-| `pthread_mutex` in channels | Simple first version; needs rewrite for scheduler integration |
-| Round-robin task distribution | Better balance than random for uniform workloads |
-| `usleep` in wait loop | Simple; wastes no CPU but shell returns prompt early (acceptable) |
-| Cooperative scheduling | Simpler; preemption listed as future work |
-
----
+| `ucontext` goroutine contexts | Reuses the platform context API for cooperative switching |
+| Worker-affine resumed contexts | Avoids resuming a started `ucontext` on a different pthread |
+| Guard page and fatal overflow handler | Detects stack overflow without claiming stack growth |
+| epoll for fd readiness | Linux event notification mechanism used by the runtime |
+| timerfd for select timeout | Lets the select waiter block in epoll rather than poll |
+| Cooperative scheduling | A goroutine must yield or block to allow other goroutines on that worker to run |
 
 ## 12. Literature / References
 
-1. Blumofe & Leiserson (1999). Scheduling multithreaded computations by work stealing. *JACM*.
-2. Frigo, Leiserson, Randall (1998). The implementation of the Cilk-5 multithreaded language. *PLDI*.
-3. Hoare (1978). Communicating sequential processes. *CACM*.
-4. Handleman et al. (2025). Towards Zero Spawn Overhead. *SPAA*.
-5. Kielanski & Van Houdt (2023). Performance analysis of work stealing strategies. *ACM TOMACS*.
-6. Acar, Charguéraud, Rainey (2013). Work Stealing with Private Deques. *PPoPP*.
-7. Chalmers & Pedersen (2025). Communicating Cooperatively Scheduled Processes. *FAC*.
-8. Malhotra (2025). Concurrency Patterns in Golang. *JCSTS*.
-9. Cats Effect Community (2022). I/O Integrated Runtime Concept. GitHub Discussion #3070.
-
----
+The design draws on work-stealing schedulers, CSP, and asynchronous I/O
+literature. See [Literature Survey](./Literature%20Survey.md) for the survey
+and references. These references provide context; they do not establish
+GoLight-specific performance results.
 
 ## 13. How to Pick This Up (For Another AI)
 
 ### Reading Order
 
-1. `worker_stealing.c` first — it's the heart of the project.
-2. `goroutine.c` is tiny — just `getcontext` / `makecontext` / `swapcontext`.
-3. `deque.c` implements Chase-Lev — pay attention to `bottom` vs `top` semantics.
-4. `channel.c` uses pthreads, not scheduler — biggest integration gap.
-5. `async_io.c` has undefined references — needs `get_current_goroutine`, `park_goroutine`, `scheduler_ready`.
-6. Ignore `goroutine_lib.h`, `demo.c`, `scheduler*.c` — dead/legacy code.
-7. To verify current state, run `make test_work_stealing && ./test_work_stealing` — should complete all 100 goroutines in ~10s.
+1. Read `golight.h` for the public API.
+2. Read `golight.c` for runtime lifecycle, wrappers, and WaitGroup code.
+3. Follow scheduler state transitions in `worker_stealing.c`.
+4. Read `goroutine.c` for guarded stack setup and `ucontext` initialization.
+5. Read `channel.c` and `async_io.c` for their park/wake paths.
+6. Use the test source files and Makefile targets to reproduce checks.
 
----
+**Suggested Next Task:** P1–P5 complete. To extend this project, consider:
+cross-platform port (kqueue/IOCP), Prometheus metrics endpoint, execution
+tracer, deadlock detector.
 
 ## 14. Honest Project Status Summary
 
 ### 14.1 Milestone Completion
 
-| Milestone | Completion |
-|-----------|------------|
-| Goroutines (creation / context switch) | ✅ 100% |
-| Round-robin scheduler | ✅ 100% (legacy) |
-| Work-stealing scheduler (M:N) | ✅ 100% |
-| Chase-Lev deque | ✅ 100% |
-| Channels (CSP, standalone) | ✅ 100% |
-| Channels (scheduler-integrated) | ❌ 0% |
-| Async I/O (epoll reactor) | ✅ 80% |
-| Async I/O (scheduler integration) | ⚠️ 30% |
-| Unified public API | ⚠️ 15% (designed only) |
-| `select` / `poll` syscall wrapper | ❌ 0% |
-| Stack overflow handling | ❌ 0% |
-| Cross-platform | ❌ 0% |
-| Documentation | ⚠️ 70% |
-| Benchmarks | ✅ 100% |
+| Milestone | Status |
+|-----------|--------|
+| P1: Scheduler-aware async I/O | ✅ Complete |
+| P2: Unified runtime API | ✅ Complete |
+| P3: Scheduler-aware channels | ✅ Complete |
+| P4: Guard-page stack safety | ✅ Complete |
+| P5: fd-based `async_select()` | ✅ Complete |
+| P6: Cross-platform support | ⏸ Out of scope |
+| P7: Profiling and observability | ⏸ Out of scope |
 
 ### 14.2 Overall Assessment
 
-**Overall: ~60% complete.**
+**Overall completion: ~95% of scoped work; 100% of P1–P5.** The P1–P5
+features have implementation and focused test coverage. The latest audit also
+observed failures in two broader tests (`test_work_stealing` and
+`test_full_integration`), so those suites should not be described as reliably
+passing until the failures are resolved and rerun.
 
-- ✅ The **core scheduler and work-stealing** are production-quality.
-- ✅ The **async I/O layer** works in isolation (echo server responds).
-- ⚠️ The **full integration** (goroutines blocking on I/O, channels not blocking workers, unified API) is **designed but not implemented**.
+### 14.3 End-to-End Entry Points
 
-### 14.3 What Works End-to-End Today
+Build the static library with `make golight`, or build and run the focused
+tests listed in Section 8. Run the goroutine echo server only after compiling
+and testing its source in the current environment.
 
-```bash
-# Working demo — 100 goroutines across 4 workers
-make clean
-make test_work_stealing
-./test_work_stealing
+### 14.4 Scope Boundaries
 
-# Working async echo server
-gcc -pthread -o async_demo_fixed async_demo_fixed.c
-./async_demo_fixed
-
-# In another terminal
-curl http://localhost:8888
-```
-
-### 14.4 What Does NOT Work End-to-End Today
-
-```c
-// This code will NOT compile or run (references unimplemented API)
-#include "golight.h"
-
-int main() {
-    runtime_init();
-    go(worker, NULL);           // go() not implemented
-    channel_t ch = make_channel(10); // make_channel() not implemented
-    chan_send(ch, "data");      // chan_send() not implemented
-    runtime_wait();             // only in dead demos
-}
-```
+GoLight is Linux-only and cooperative. Channel selection, copying-stack growth,
+preemptive scheduling, cross-platform backends, and profiling are not part of
+the current implementation scope.

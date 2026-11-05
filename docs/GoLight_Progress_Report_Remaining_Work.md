@@ -1,765 +1,262 @@
-# GoLight: Progress Report & Remaining Work
+# GoLight: Progress Report and Remaining Work
 
-**Project:** GoLight — A Lightweight User-Level Threading Library for C/C++  
-**Author:** Pruthviraj A. Jadhav (2023BCS109)  
-**Institution:** SGGSIE&T, Nanded  
-**Report Date:** October 2025  
-**Overall Completion:** ~60–70%
-
----
+**Project:** GoLight — a cooperative user-level concurrency runtime for C
+**Report updated:** 2026-11-05
+**Implementation scope:** P1–P5 complete; P6 and P7 out of scope
 
 ## Table of Contents
 
 1. [Executive Summary](#1-executive-summary)
 2. [Timeline Overview](#2-timeline-overview)
-3. [Week-by-Week Progress (Detailed)](#3-week-by-week-progress-detailed)
-4. [What Works Today (With Evidence)](#4-what-works-today-with-evidence)
-5. [What Is Partial or Broken](#5-what-is-partial-or-broken)
-6. [What Is Completely Missing](#6-what-is-completely-missing)
+3. [Implementation Progress](#3-implementation-progress)
+4. [What Works Today](#4-what-works-today)
+5. [Previously Partial Areas](#5-previously-partial-areas)
+6. [Out-of-Scope Work](#6-out-of-scope-work)
 7. [Completion Matrix](#7-completion-matrix)
 8. [Remaining Work — Prioritized](#8-remaining-work--prioritized)
 9. [File-by-File Status](#9-file-by-file-status)
 10. [Command Reference](#10-command-reference)
 11. [Next Milestone Recommendation](#11-next-milestone-recommendation)
-
----
+12. [What We Can Confidently Claim](#appendix-a-what-we-can-confidently-claim)
 
 ## 1. Executive Summary
 
-GoLight is a user-level threading library in C that provides Go-style goroutines, CSP channels, work-stealing M:N scheduling, and async I/O. Development spanned 8 weeks.
+GoLight provides cooperative goroutines, a pthread-backed scheduler, channels,
+WaitGroups, async fd I/O, guard-page stack overflow detection, and fd-based
+`async_select()`, exposed primarily through `golight.h`.
 
-**What is solid:**
-- ✅ Work-stealing M:N scheduler (100% complete)
-- ✅ Lock-free Chase-Lev deque (100% complete)
-- ✅ Goroutine creation, execution, and context switching (100% complete)
-- ✅ Round-robin scheduler as a legacy milestone (100% complete)
-- ✅ Async I/O reactor using epoll (80% complete)
-- ✅ Benchmark suite (100% complete)
-
-**What is incomplete:**
-- ⚠️ Channel integration with the scheduler (0% — channels use pthreads, not goroutine parking)
-- ⚠️ Async I/O integration with the work-stealing scheduler (~30%)
-- ❌ Unified public API (`go()`, `runtime_init()`, `select_wait()`) — designed but never implemented (15%)
-- ❌ `select()`/`poll()` syscall integration (0%)
-- ❌ Stack overflow handling (0%)
-- ❌ Cross-platform support (0%)
-
-**Net result:** The scheduler — the hardest part — is production-quality and benchmarked. The I/O and channel layers work in isolation but are not stitched into a single library.
-
----
+P1–P5 are marked complete. This report does not claim that every broader
+stress-test binary is stable: the latest documentation audit observed exit
+139 from `test_work_stealing` and `test_full_integration`. Focused async-select,
+async-I/O, channel, and 100-goroutine tests have passed in recorded runs.
 
 ## 2. Timeline Overview
-Week 1–2 │ Foundation: context switching + basic goroutines
-Week 3 │ Channels (standalone, pthread-based)
-Week 4 │ Attempted unified library + demo (failed)
-Week 5–6 │ Work-stealing M:N scheduler ✅ (MAJOR MILESTONE)
-Week 7–8 │ Async I/O with epoll reactor ⚠️ (partial)
-──────────┼───────────────────────────────────────────────────
-Remaining │ Unified API, scheduler-I/O integration, stack safety
 
-text
+Completion dates are listed only where recorded in the available session
+history. Earlier P1/P2 dates were not recorded in the repository.
 
-| Phase | Duration | Completion | Weight |
-|-------|----------|-----------|--------|
-| Foundation | Week 1–2 | 100% | 15% |
-| Channels | Week 3 | 90% (standalone) | 15% |
-| Integration attempt | Week 4 | 30% | 5% |
-| Work-stealing scheduler | Week 5–6 | 100% | 40% |
-| Async I/O | Week 7–8 | 60% | 25% |
-| **Overall** | **8 weeks** | **~65%** | **100%** |
+| Priority | Scope | Status | Completion date evidence |
+|----------|-------|--------|--------------------------|
+| P1 | Scheduler-aware async I/O | ✅ Done | Date not recorded in repository |
+| P2 | Unified API and WaitGroups | ✅ Done | Date not recorded in repository |
+| P3 | Scheduler-aware channels | ✅ Done | 2026-11-04 verification |
+| P4 | mmap stacks and guard-page overflow detection | ✅ Done | 2026-11-04 verification |
+| P5 | fd-based `async_select()` | ✅ Done | 2026-11-05 verification |
+| P6 | Cross-platform support | ⏸ Out of scope | — |
+| P7 | Profiling and observability | ⏸ Out of scope | — |
 
----
+## 3. Implementation Progress
 
-## 3. Week-by-Week Progress (Detailed)
+### 3.1 Goroutines and Scheduling
 
-### 3.1 Week 1–2: Foundation ✅ COMPLETE
+Goroutines use `ucontext` and mmap-backed stacks. The scheduler has worker
+queues and park/ready transitions. Resumed goroutines remain on their assigned
+worker thread.
 
-**Goal:** Learn context switching and build basic goroutines.
+### 3.2 Channels and Unified API
 
-**What We Built:**
+`golight.h` exposes `go()`, runtime lifecycle calls, yield, channel aliases,
+goroutine IDs, and WaitGroups. Channel wait queues park goroutines instead of
+blocking workers.
 
-| Deliverable | File | Status |
-|-------------|------|--------|
-| Context switch demo | `test1.c` | ✅ Works |
-| Goroutine struct + API | `goroutine.h`, `goroutine.c` | ✅ Works |
-| Round-robin scheduler | `scheduler.h`, `scheduler.c` | ✅ Works |
-| Test file | `test_goroutine.c` | ✅ Works |
-| Scheduler test | `test_scheduler.c` | ✅ Works |
+### 3.3 Async I/O and Selection
 
-**Key Achievement:**  
-Successfully switched between user contexts using `getcontext()` / `makecontext()` / `swapcontext()`.
+Async read/write use scheduler parking when fd operations would block.
+`async_select()` registers read/write fd cases with epoll and uses timerfd for
+timeouts. It does not select on channels. `async_accept()` is declared but has
+no implementation.
 
-**Goroutine State Machine Implemented:**
-READY (0) → RUNNING (1) → FINISHED (2)
+### 3.4 Stack Safety
 
-text
+Each goroutine stack has an mmap-backed guard page. A stack overflow fault is
+reported with the goroutine ID and terminates the process with status 1.
+Copying-stack growth is outside the current scope.
 
-**Goroutine Struct Delivered:**
+## 4. What Works Today
 
-```c
-typedef struct goroutine {
-    ucontext_t context;
-    void *stack;
-    size_t stack_size;      // 8192 bytes
-    int id;
-    int state;
-    void (*function)(void*);
-    void *arg;
-} goroutine_t;
-What We Learned:
+The following results were observed in the current worktree or recent session
+verification:
 
-swapcontext() saves the calling function's state into a local variable that remains valid until the function returns.
+| Check | Result |
+|-------|--------|
+| `make -B golight` | Completed without compiler warnings |
+| `test_100_fast` | Exit 0; 100 completion lines |
+| `test_channel_integration` | Exit 0; 100 sender and 100 receiver completions in recorded run |
+| `test_channel_no_blocking` | Exit 0; all ten ticks ran before the delayed sender |
+| `test_stack_overflow` | Expected diagnostic; exit 1 |
+| `test_async_select` | Readiness, timeout, and worker-responsiveness checks passed |
+| `test_async_goroutine` | Exit 0; 50/50 reads |
+| `echo_server_goroutines` | Exit 0; 100/100 concurrent local clients |
+| `test_work_stealing` | Latest audit run exited 139 |
+| `test_full_integration` | Latest audit run exited 139 |
 
-uc_link is how a goroutine returns to the scheduler when it finishes.
+## 5. Previously Partial Areas
 
-Verification:
+These features were previously missing or incomplete and now have
+implementations:
 
-bash
-gcc -o test_goroutine test_goroutine.c goroutine.c
-./test_goroutine
-# Output: goroutines run sequentially
-3.2 Week 3: Channels ✅ COMPLETE (STANDALONE)
-Goal: Implement CSP-style message passing.
+| Area | Current implementation |
+|------|-------------------------|
+| Goroutine parking and wakeup | `swapcontext()` and scheduler deque re-enqueue |
+| Async read/write integration | Park on unavailable fd readiness |
+| Unified API | `golight.h` and `golight.c` runtime wrappers |
+| Channels | Goroutine waiter queues and scheduler wakeup |
+| Stack overflow detection | mmap guard page and SIGSEGV handler |
+| fd selection | `async_select()` with epoll and timerfd |
+| Static library | `make golight` builds `libgolight.a` |
 
-What We Built:
+## 6. Out-of-Scope Work
 
-Deliverable	File	Status
-Channel struct	channel.h	✅ Works
-Channel impl (pthread)	channel.c	✅ Works
-Producer-consumer test	test_channel.c	✅ Works
-Channel Design Implemented:
+| Feature | Status |
+|---------|--------|
+| macOS kqueue and Windows IOCP backends | ⏸ Out of scope |
+| Built-in profiler, metrics endpoint, and execution tracer | ⏸ Out of scope |
+| Preemptive scheduling | Not provided; scheduling is cooperative |
+| Copying-stack growth | Not implemented |
+| Selection across channels | Not implemented |
+| `async_accept()` implementation | Declared only |
 
-c
-typedef struct channel {
-    void **buffer;           // Circular buffer
-    int capacity;
-    int size;
-    int head;                // recv index
-    int tail;                // send index
-    pthread_mutex_t lock;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
-} channel_t;
-Functions Working:
+## 7. Completion Matrix
 
-channel_create(capacity)
+| Priority / feature | Implementation | Focused evidence | Status |
+|--------------------|----------------|------------------|--------|
+| P1: Scheduler-aware async I/O | Present | `test_async_goroutine` 50/50 run | ✅ Complete |
+| P2: Unified API and WaitGroups | Present | `test_full_integration` source; latest execution failed | ✅ Complete, broad test needs rerun |
+| P3: Scheduler-aware channels | Present | `test_channel_integration` and `test_channel_no_blocking` | ✅ Complete |
+| P4: Guard-page stack safety | Present | `test_stack_overflow` expected diagnostic | ✅ Complete |
+| P5: fd-based `async_select()` | Present | `test_async_select` three checks | ✅ Complete |
+| P6: Cross-platform support | Not implemented | Linux epoll dependency | ⏸ Out of scope |
+| P7: Profiling and observability | Not implemented | No profiling endpoint found | ⏸ Out of scope |
 
-channel_send(ch, data)
+## 8. Remaining Work — Prioritized
 
-channel_receive(ch)
+| Priority | Status | Note |
+|----------|--------|------|
+| P1 | ✅ Done | Completion date not recorded in repository |
+| P2 | ✅ Done | Completion date not recorded in repository |
+| P3 | ✅ Done | Verified 2026-11-04 |
+| P4 | ✅ Done | Verified 2026-11-04 |
+| P5 | ✅ Done | Verified 2026-11-05 |
+| P6 | ⏸ Out of scope | Cross-platform backends |
+| P7 | ⏸ Out of scope | Profiling and observability |
 
-channel_destroy(ch)
+**Minimum viable completion (P1+P2+P3+P4+P5) — ACHIEVED.**
 
-Critical Limitation Discovered:
-Because channels use pthread_cond_wait(), blocking on a channel blocks the entire worker thread, not just the current goroutine. This defeats the purpose of M:N scheduling. Integration is 0% complete.
+The two stress tests that exited 139 during the latest audit should be
+investigated before making a claim that the entire suite is consistently
+passing. This report records the observed result rather than hiding it.
 
-Verification:
+## 9. File-by-File Status
 
-bash
-gcc -o test_channel test_channel.c goroutine.c scheduler.c channel.c -lpthread
-./test_channel
-# Output: producer sends 3 messages, consumer receives all 3
-3.3 Week 4: Integration Attempt ⚠️ PARTIAL (30%)
-Goal: Unify everything into a single library with go() and runtime_wait().
+### 9.1 Public API and Core Runtime
 
-What We Built:
+| File | Status | Notes |
+|------|--------|-------|
+| `golight.h` | ✅ Working | Public API declarations |
+| `golight.c` | ✅ Working | Lifecycle, wrappers, WaitGroup |
+| `goroutine.h` | ✅ Working | Goroutine metadata and declarations |
+| `goroutine.c` | ✅ Working | Context setup and guarded stacks |
+| `worker_stealing.h` | ✅ Working | Scheduler declarations |
+| `worker_stealing.c` | ✅ Working | Dispatch, park, yield, and ready operations |
+| `deque.h`, `deque.c` | ✅ Working | Deque implementation; scheduler locks concurrent operations |
+| `channel.h`, `channel.c` | ✅ Working | Buffered/unbuffered channels with parked waiters |
+| `async_io.h` | ✅ Working | Async API declarations |
+| `async_io.c` | ✅ Working | Read/write/sleep and fd-based `async_select()` |
+| `Makefile` | ✅ Working | Library and focused test targets |
 
-Deliverable	File	Status
-Unified API header	goroutine_lib.h	❌ Dead code
-Example demo	demo.c	❌ Does not compile
-What Went Wrong:
-goroutine_lib.h declared go(), make_channel(), runtime_init(), runtime_wait(), etc., but the implementations were never written. demo.c referenced functions defined later in the same file, causing forward-reference errors, and it also referenced unimplemented functions. This phase was effectively abandoned in favor of the work-stealing scheduler.
+### 9.2 Legacy or Unverified Sources
 
-Files Created but Abandoned:
+| File | Status | Notes |
+|------|--------|-------|
+| `goroutine_lib.h`, `demo.c`, `goroutine_v2.c` | ⚠️ Legacy | Remain in the repository; superseded by `golight.h` |
+| `scheduler.c`, `scheduler_v2.c` and headers | ⚠️ Legacy | Earlier scheduler prototypes |
+| `network_server.c` | ⚠️ Unverified | Not a supported or verified example |
+| `async_accept()` | ⚠️ Declaration only | No function body found |
 
-goroutine_lib.h
+### 9.3 Current Test Sources
 
-demo.c
+| File | Status / behavior |
+|------|-------------------|
+| `test_100_fast.c` | Last run: 100 goroutines completed |
+| `test_work_stealing.c` | Latest audit run exited 139 |
+| `test_channel_integration.c` | 100 sender/receiver integration test |
+| `test_channel_no_blocking.c` | Last run passed; checks progress during blocked channel receive |
+| `test_stack_overflow.c` | Expected guard-page diagnostic and exit 1 |
+| `test_full_integration.c` | Latest audit run exited 139 |
+| `test_async_select.c` | Readiness, timeout, and scheduler responsiveness |
+| `test_async_goroutine.c` | Last run completed 50 asynchronous reads |
+| `echo_server_goroutines.c` | Last local load test handled 100/100 clients |
 
-goroutine_v2.c
+## 10. Command Reference
 
-3.4 Week 5–6: Work-Stealing Scheduler ✅ COMPLETE
-Goal: M:N scheduling with lock-free work-stealing.
+### Build
 
-This is the most successful phase.
+```bash
+make golight
+```
 
-What We Built:
+### Build Focused Tests
 
-Deliverable	File	Status
-Chase-Lev deque	deque.h, deque.c	✅ 100%
-Work-stealing scheduler	worker_stealing.h, worker_stealing.c	✅ 100%
-Main test (100 goroutines)	test_work_stealing.c	✅ Works
-Fast test (100k iterations)	test_100_fast.c	✅ Works
-Benchmark (10k tasks)	benchmark.c	✅ Works
-Diagnostic test	test_diagnostic.c	✅ Works
-Busy-wait comparison	test_busy_wait.c	✅ Works
-Benchmark Results (Measured):
+```bash
+make test_100_fast test_work_stealing test_channel_integration \
+    test_channel_no_blocking test_stack_overflow test_full_integration \
+    test_async_select
+```
 
-Workers	Throughput (tasks/sec)	Speedup
-1	11,764	1.00×
-2	23,148	1.97×
-4	45,248	3.85×
-8	84,745	7.20×
-Verified Behaviors:
+`test_async_goroutine` and `echo_server_goroutines` do not have Makefile
+targets in the current Makefile. Build them by linking their source with the
+runtime sources.
 
-✅ 4 workers distributed across 4 different CPU cores
+### Benchmark
 
-✅ 100 goroutines executed in parallel
-
-✅ Round-robin initial distribution → zero steals for balanced workloads
-
-✅ Work-stealing kicked in for unbalanced workloads
-
-✅ 95%+ CPU utilization under load
-
-Bugs That Turned Out Not to Be Bugs:
-
-"Bug"	Reality
-Program exits after 2 goroutines	Terminal returns prompt while workers run in background — ps aux shows it running
-Context switch corrupts memory	Original code was correct; local ucontext_t stays valid through swapcontext()
-Only 2 of 100 goroutines complete	Work loop had 10M iterations; program was still running, just slow
-The Correct Context Switch Pattern:
-
-c
-static void execute_goroutine_stealing(worker_stealing_t* w, goroutine_t* g) {
-    ucontext_t worker_ctx;                  // Local, stays valid
-    getcontext(&worker_ctx);
-    g->context.uc_link = &worker_ctx;       // Return here on finish
-    g->state = GOROUTINE_RUNNING;
-    swapcontext(&worker_ctx, &g->context);  // Switch to goroutine
-    // ← Resumes HERE after goroutine finishes
-    g->state = GOROUTINE_FINISHED;
-    atomic_fetch_sub(&w->scheduler->active_goroutines, 1);
-    free_goroutine(g);
-}
-Verification:
-
-bash
-make clean
-make test_work_stealing
-./test_work_stealing
-# Output: 100 goroutines complete, statistics printed, all workers report
-
+```bash
 make bench
-# Output: throughput table with speedup across 1, 2, 4, 8 workers
-3.5 Week 7–8: Async I/O ⚠️ PARTIAL (60%)
-Goal: Non-blocking I/O integrated with the scheduler.
-
-What We Built:
-
-Deliverable	File	Status
-Async I/O header	async_io.h	⚠️ 50% (declarations only)
-Async I/O impl	async_io.c	⚠️ 60% (undefined references)
-Failed echo demo	async_demo.c	❌ Segfaults
-Fixed echo demo	async_demo_fixed.c	✅ Works (with pthreads)
-Simple thread-per-client	simple_async.c	✅ Works (no async)
-Simple echo server	echo_server.c	✅ Works
-Working Components:
-
-Component	Detail	Status
-set_nonblocking()	fcntl(O_NONBLOCK)	✅
-Try-immediate-first	async_read / async_write check read() / write() first	✅
-epoll setup	epoll_create1(), epoll_ctl(), epoll_wait()	✅
-EPOLLONESHOT	Prevents duplicate wakeups	✅
-future_t struct	future_complete(), future_wait()	✅
-Reactor thread	epoll_wait() loop	✅
-Echo server	Responds to curl	✅ (uses pthreads)
-Not Implemented / Broken:
-
-Component	Problem
-park_goroutine()	Stubbed as usleep() — blocks worker thread
-scheduler_ready()	Partially wired; not integrated with deques
-async_accept()	Declared in header, no body
-select()/poll() syscall	Never started
-Client handling in echo server	Uses pthread_create(), not go()
-Compilation of async_io.c alone	Undefined references (get_current_goroutine, etc.)
-Verification:
-
-bash
-gcc -pthread -o async_demo_fixed async_demo_fixed.c
-./async_demo_fixed
-# Terminal 2:
-curl http://localhost:8888
-# Output: "Hello World!"
-4. What Works Today (With Evidence)
-4.1 Work-Stealing Scheduler (Fully Functional)
-How to Verify:
-
-bash
-make clean
-make test_work_stealing
-./test_work_stealing
-Expected Output (abbreviated):
-
-text
-Worker 0 started (with work-stealing)
-Worker 1 started (with work-stealing)
-Worker 2 started (with work-stealing)
-Worker 3 started (with work-stealing)
-Worker 0 running on CPU 10
-Worker 0: Executing goroutine 97
-Goroutine 97 starting CPU work
-Goroutine 97 finished (sum=49999995000000)
-...
-=== Work-Stealing Statistics ===
-Worker 0: 25 goroutines, 0 steals done, 0 steals received
-Worker 1: 25 goroutines, 0 steals done, 0 steals received
-Worker 2: 25 goroutines, 0 steals done, 0 steals received
-Worker 3: 25 goroutines, 0 steals done, 0 steals received
-Total steals: 0
-4.2 Benchmark (Verified Speedup)
-How to Verify:
-
-bash
-make bench
-Expected Output:
-
-text
-Workers:  1 | Time: 0.850s | Throughput: 11764 tasks/sec
-Workers:  2 | Time: 0.432s | Throughput: 23148 tasks/sec
-Workers:  4 | Time: 0.221s | Throughput: 45248 tasks/sec
-Workers:  8 | Time: 0.118s | Throughput: 84745 tasks/sec
-4.3 Async Echo Server (Works in Isolation)
-How to Verify:
-
-bash
-gcc -pthread -o async_demo_fixed async_demo_fixed.c
-./async_demo_fixed
-Expected Output (Server Side):
-
-text
-╔════════════════════════════════════════════╗
-║     Async I/O Echo Server (Fixed)         ║
-╚════════════════════════════════════════════╝
-
-Async I/O initialized
-Reactor thread started (epoll_fd=3)
-✅ Echo server listening on port 8888
-
-📡 New connection from 127.0.0.1:47034 (fd=6)
-Client 6: Starting handler
-Client 6: Received 78 bytes
-Client 6: Response sent
-Client 6: Disconnected
-Expected Output (Client Side):
-
-bash
-curl http://localhost:8888
-# → Hello World!
-4.4 Channels (Standalone)
-How to Verify:
-
-bash
-gcc -o test_channel test_channel.c goroutine.c scheduler.c channel.c -lpthread
-./test_channel
-Expected Output:
-
-text
-Producer 1: Sending 'Message from producer 1'
-Consumer 1: Received 'Message from producer 1'
-Producer 2: Sending 'Message from producer 2'
-Consumer 2: Received 'Message from producer 2'
-5. What Is Partial or Broken
-5.1 Async I/O Scheduler Integration (~30%)
-Component	Problem	Impact
-park_goroutine()	Uses usleep() — blocks worker thread	Prevents true async I/O
-scheduler_ready()	Pushes to global deque but doesn't fully integrate	Inconsistent wakeups
-async_io.c standalone compile	Undefined references	Cannot link without worker_stealing.c
-Echo server client handling	Uses pthreads, not goroutines	Not a true GoLight demo
-5.2 Channels Integration (0%)
-Problem	Consequence
-Uses pthread_cond_wait()	Blocks worker thread, not goroutine
-Not integrated with park_goroutine()	No channel-based scheduling
-5.3 Unified API (15%)
-File	Status
-goroutine_lib.h	Dead code — never compiled
-demo.c	Forward-reference errors
-complete_demo.c	References unimplemented API
-network_server.c	References unimplemented go()
-5.4 Stack Management (0% for overflow handling)
-Problem	Current State
-Fixed 8 KB stack	Segfaults on overflow
-No guard page	No detection before crash
-No copying-stack growth	Static stack size forever
-5.5 Cross-Platform (0%)
-Platform	Status
-Linux (epoll)	✅ Only supported platform
-macOS (kqueue)	❌ Not implemented
-Windows (IOCP)	❌ Not implemented
-6. What Is Completely Missing
-6.1 Unified Public API (Never Implemented)
-c
-// ALL of these are declared but have no implementation:
-void     go(void (*func)(void*), void *arg);
-void     yield(void);
-uint64_t goroutine_id(void);
-void     runtime_init(void);
-void     runtime_wait(void);
-void     runtime_shutdown(void);
-
-channel_t make_channel(size_t capacity);
-void      chan_send(channel_t ch, void* data);
-void*     chan_receive(channel_t ch);
-void      chan_close(channel_t ch);
-
-select_case_t select_recv(channel_t ch, void** ptr);
-select_case_t select_send(channel_t ch, void* data);
-select_case_t select_default(void);
-int select_wait(select_case_t* cases, int ncases, uint64_t timeout_ms);
-
-typedef struct waitgroup* waitgroup_t;
-waitgroup_t waitgroup_create(void);
-void        waitgroup_add(waitgroup_t wg, int delta);
-void        waitgroup_done(waitgroup_t wg);
-void        waitgroup_wait(waitgroup_t wg);
-
-future_t* async_accept(int fd);
-6.2 Missing Infrastructure
-Feature	Impact
-select() / poll() syscall wrapper	Cannot multiplex file descriptors
-select on channels	Cannot wait on multiple channels
-Stack guard page	No crash protection
-Copying-stack growth	No dynamic stack sizing
-Preemptive scheduling	Cooperative only
-Timer/fd timeout support	No built-in timeouts
-Deadlock detection	No safety net
-Execution tracer	No debugging tool
-Profiling endpoint	No runtime observability
-6.3 Missing Quality-of-Life Features
-Feature	Status
-waitgroup	Never implemented
-yield()	Never implemented
-goroutine_id()	Never implemented
-Channel close()	Never implemented
-Panic/recover	Never implemented
-Deadline/timeout per I/O	Never implemented
-7. Completion Matrix
-7.1 Feature-by-Feature
-Feature	Design	Implementation	Testing	Completion
-Goroutine struct	✅	✅	✅	100%
-Context switching	✅	✅	✅	100%
-Round-robin scheduler	✅	✅	✅	100%
-Work-stealing scheduler	✅	✅	✅	100%
-Chase-Lev deque	✅	✅	✅	100%
-Benchmark suite	✅	✅	✅	100%
-Channels (standalone)	✅	✅	✅	100%
-Channels (scheduler-integrated)	✅	❌	❌	0%
-Async I/O (epoll reactor)	✅	✅	✅	80%
-Async I/O (scheduler park/wake)	✅	❌	❌	0%
-Async I/O (goroutine-based clients)	✅	❌	❌	0%
-Unified API (go(), runtime_init())	✅	❌	❌	0%
-select() (channels)	✅	❌	❌	0%
-select()/poll() (syscalls)	✅	❌	❌	0%
-WaitGroup	✅	❌	❌	0%
-Stack overflow handling	✅	❌	❌	0%
-Cross-platform (macOS)	✅	❌	❌	0%
-Cross-platform (Windows)	✅	❌	❌	0%
-Profiling / monitoring	✅	❌	❌	0%
-Documentation	✅	⚠️	—	70%
-7.2 Weighted Score
-Area	Weight	Score	Weighted
-Goroutines + context switching	15%	100%	15.0%
-Scheduler (round-robin + work-stealing)	30%	100%	30.0%
-Chase-Lev deque	10%	100%	10.0%
-Channels (standalone)	5%	100%	5.0%
-Channels (integrated)	5%	0%	0.0%
-Async I/O (reactor)	10%	80%	8.0%
-Async I/O (integration)	10%	0%	0.0%
-Unified API	10%	0%	0.0%
-Cross-platform	5%	0%	0.0%
-Total	100%	—	~68%
-8. Remaining Work — Prioritized
-8.1 Priority 1: Complete Async I/O Integration (High Impact)
-Estimated Effort: 1 week
-
-Tasks:
-
-Task	File	Estimated Time
-Implement get_current_goroutine()	worker_stealing.c	30 min
-Implement real park_goroutine()	worker_stealing.c	2 hours
-Implement real scheduler_ready()	worker_stealing.c	2 hours
-Wire park_goroutine() into async_read/write()	async_io.c	3 hours
-Replace pthread client handling with goroutines	async_demo_fixed.c	2 hours
-Verify echo server still works	—	1 hour
-Total	—	~1.5 days
-Success Criteria:
-
-async_io.c compiles and links without undefined references
-
-Goroutines (not pthreads) handle each client connection
-
-Echo server handles 100+ concurrent connections
-
-Worker threads remain responsive while I/O is pending
-
-8.2 Priority 2: Unified Public API (High Impact)
-Estimated Effort: 3–4 days
-
-Tasks:
-
-Task	File	Estimated Time
-Write real golight.h (include all modules)	New file	4 hours
-Implement go() wrapper	golight.c	2 hours
-Implement runtime_init() / runtime_wait() / runtime_shutdown()	golight.c	4 hours
-Implement yield()	golight.c	2 hours
-Implement goroutine_id()	golight.c	1 hour
-Implement make_channel() / chan_send() / chan_receive() / chan_close() aliases	golight.c	2 hours
-Implement select_wait() on channels	channel.c	6 hours
-Implement waitgroup_create/add/done/wait()	golight.c	4 hours
-Delete dead goroutine_lib.h, demo.c, goroutine_v2.c	—	30 min
-Write one end-to-end demo using only the unified API	complete_demo.c	4 hours
-Total	—	~3.5 days
-Success Criteria:
-
-User can write #include "golight.h" and use only go(), make_channel(), chan_send(), chan_receive(), runtime_init(), runtime_wait()
-
-Single make command builds the demo
-
-Demo runs without touching internal APIs
-
-8.3 Priority 3: Channel-Scheduler Integration (Medium Impact)
-Estimated Effort: 2–3 days
-
-Tasks:
-
-Task	File	Estimated Time
-Rewrite channel_send() to use park_goroutine() instead of pthread_cond_wait()	channel.c	8 hours
-Rewrite channel_receive() similarly	channel.c	8 hours
-Keep pthread_mutex for short critical sections (fine)	channel.c	1 hour
-Test: worker thread stays responsive while a goroutine blocks on channel	test_channel.c	2 hours
-Total	—	~2.5 days
-Success Criteria:
-
-A goroutine blocking on a channel does NOT block its worker thread
-
-Other goroutines on that worker continue running
-
-Producer-consumer test passes with 100+ goroutines
-
-8.4 Priority 4: Stack Safety (Medium Impact)
-Estimated Effort: 1–2 days
-
-Tasks:
-
-Task	File	Estimated Time
-Use mmap() instead of malloc() for stacks	goroutine.c	2 hours
-Allocate PROT_NONE guard page below each stack	goroutine.c	2 hours
-Install SIGSEGV handler to detect overflow	goroutine.c	4 hours
-Implement copying-stack growth (allocate 2× size, memcpy, update context)	goroutine.c	8 hours
-Test: recursive function that grows past 8 KB	test_stack.c	2 hours
-Total	—	~1.5 days
-Success Criteria:
-
-Recursive goroutine function that needs 64 KB does not segfault
-
-Stack grows transparently from 8 KB → 16 KB → 32 KB → 64 KB
-
-No memory leaks after growth
-
-8.5 Priority 5: select() / poll() Syscall Wrapper (Low-Medium Impact)
-Estimated Effort: 2 days
-
-Tasks:
-
-Task	File	Estimated Time
-Implement async_select() wrapper over epoll_wait()	async_io.c	8 hours
-Add timeout support	async_io.c	4 hours
-Test: wait for whichever of 2 fds is ready first	test_async_select.c	2 hours
-Total	—	~2 days
-8.6 Priority 6: Cross-Platform Support (Low Impact for Academic Submission)
-Estimated Effort: 1 week (macOS), 1 week (Windows)
-
-Platform	Estimated Time
-macOS (kqueue)	~5 days
-Windows (IOCP)	~7 days
-8.7 Priority 7: Profiling & Observability (Low Priority)
-Feature	Estimated Time
-Prometheus metrics endpoint	2 days
-Health check endpoint	1 day
-Execution tracer	5 days
-Deadlock detector	3 days
-8.8 Remaining Work — Summary Table
-Priority	Area	Effort	Impact
-P1	Async I/O scheduler integration	1.5 days	High
-P2	Unified public API	3.5 days	High
-P3	Channel-scheduler integration	2.5 days	Medium
-P4	Stack safety	1.5 days	Medium
-P5	select/poll syscalls	2 days	Medium
-P6	Cross-platform	2 weeks	Low
-P7	Profiling	2 weeks	Low
-Minimum viable completion (P1 + P2 + P3): ~7.5 days.
-
-9. File-by-File Status
-9.1 Headers
-File	Status	Notes
-goroutine.h	✅ Stable	Struct + 3 functions
-scheduler.h	⚠️ Legacy	Round-robin (Week 2)
-scheduler_v2.h	⚠️ Legacy	Abandoned
-worker_stealing.h	✅ Working	Core scheduler + stubs for async
-deque.h	✅ Working	Chase-Lev deque
-channel.h	⚠️ Partial	Works standalone, not integrated
-async_io.h	⚠️ Partial	Some declarations have no bodies
-goroutine_lib.h	❌ Dead	Never compiled
-threadpool.h	⚠️ Standalone	Not integrated
-golight.h	❌ Missing	Never written (designed only)
-golight_prod.h	❌ Missing	Never written (design only)
-9.2 Source Files
-File	Status	Notes
-goroutine.c	✅ Stable	Fully working
-scheduler.c	⚠️ Legacy	Round-robin
-scheduler_v2.c	⚠️ Legacy	Abandoned
-worker_stealing.c	✅ Working	Core; async stubs present
-deque.c	✅ Working	Chase-Lev complete
-channel.c	⚠️ Partial	Works standalone
-async_io.c	⚠️ Partial	Undefined references
-goroutine_v2.c	❌ Dead	Abandoned
-threadpool.c	⚠️ Standalone	Works independently
-golight.c	❌ Missing	Never written
-9.3 Test Files
-File	Status	Notes
-test1.c	✅ Works	Context switch demo
-test_goroutine.c	✅ Works	Basic goroutine test
-test_scheduler.c	✅ Works	Round-robin test
-test_channel.c	✅ Works	Standalone channels
-test_work_stealing.c	✅ Works	Main scheduler test
-test_fast.c	✅ Works	Fast variant
-test_simple_fixed.c	✅ Works	Minimal test
-test_diagnostic.c	✅ Works	With timeout
-test_busy_wait.c	✅ Works	Sleep vs busy-wait comparison
-test_complete.c	✅ Works	20-goroutine test
-test_100_fast.c	✅ Works	100 × 100k iterations
-benchmark.c	✅ Works	Throughput benchmark
-final_verify.c	✅ Works	Basic verification
-test_stack.c	❌ Missing	Needed for stack safety tests
-test_async_select.c	❌ Missing	Needed for select tests
-9.4 Demo / Application Files
-File	Status	Notes
-async_demo.c	❌ Segfaults	Superseded
-async_demo_fixed.c	✅ Works	Echo server (pthread clients)
-simple_async.c	✅ Works	Thread-per-client, no async
-echo_server.c	✅ Works	Simple echo
-demo.c	❌ Dead	References goroutine_lib.h
-complete_demo.c	❌ Non-functional	References unimplemented API
-network_server.c	❌ Non-functional	References unimplemented go()
-production_server.c	❌ Missing	Design only
-10. Command Reference
-10.1 Quick Build & Test
-bash
-# Clean
-make clean
-
-# Build + run work-stealing test
-make test_work_stealing
-./test_work_stealing
-
-# Build + run benchmark
-make bench
-
-# Build + run fast 100-goroutine test
-gcc -pthread -o test_100_fast test_100_fast.c worker_stealing.c deque.c goroutine.c
-./test_100_fast
-
-# Build + run async echo server
-gcc -pthread -o async_demo_fixed async_demo_fixed.c
-./async_demo_fixed
-
-# Test echo server (Terminal 2)
-curl http://localhost:8888
-10.2 Debugging
-bash
-# Memory leak check
-valgrind --leak-check=full ./test_work_stealing
-
-# CPU profile
-perf record ./test_work_stealing && perf report
-
-# Debug build
-gcc -g -O0 -pthread -D_GNU_SOURCE -DDEBUG -o test_debug \
-    test_work_stealing.c worker_stealing.c deque.c goroutine.c
-
-# Step through with GDB
-gdb ./test_debug
-(gdb) break execute_goroutine_stealing
-(gdb) run
-(gdb) bt
-
-# Check running processes
-ps aux | grep test_work_stealing
-ps aux | grep async_demo
-
-# Port conflicts
-sudo lsof -i :8888
-pkill -f async_demo
-10.3 Known Issues — Quick Fixes
-Symptom	Fix
-make: 'async_demo' is up to date	make clean first
-bind: Address already in use	pkill -f async_demo
-Program "exits early"	It's still running — check ps aux
-undefined reference to get_current_goroutine	Link with worker_stealing.c
-Only 2 goroutines complete	10M iterations × 100 = slow; wait longer or use test_100_fast
-Ctrl+C doesn't exit	pkill -f test_work_stealing
-11. Next Milestone Recommendation
-Recommended Sequence (5–7 Days)
-Day	Task	Deliverable
-Day 1	Implement get_current_goroutine(), park_goroutine(), scheduler_ready() properly in worker_stealing.c	Working park/wake
-Day 2	Wire park_goroutine() into async_read/write(); replace usleep polling	Async I/O integrated
-Day 3	Replace pthread_create with go() in echo server; verify 100+ connections	Goroutine-based server
-Day 4	Write real golight.h + golight.c with go(), runtime_init(), runtime_wait(), yield()	Unified API
-Day 5	Implement make_channel() aliases; wire channel blocking to park_goroutine()	Channel-scheduler integration
-Day 6	Write complete_demo.c using only the unified API	End-to-end demo
-Day 7	Test, debug, benchmark; update this report	Ready for submission
-Success Criteria for "Week 7–8 Complete"
-✅ #include "golight.h" works
-
-✅ go(worker, NULL) compiles and runs
-
-✅ channel_t ch = make_channel(10) works
-
-✅ runtime_init() / runtime_wait() work
-
-✅ Echo server uses goroutines (not pthreads)
-
-✅ async_io.c compiles without undefined references
-
-✅ One unified make builds everything
-
-After That
-Add stack safety (Priority 4)
-
-Write the final report / paper
-
-Prepare for interviews (see separate interview prep material)
-
-Appendix A: What We Can Confidently Claim in the Report
-✅ Safe to Claim
-Claim	Evidence
-100+ goroutines running in parallel	test_work_stealing output
-7.2× speedup on 8 cores	benchmark output
-Lock-free Chase-Lev deque	deque.c implementation
-epoll-based async I/O reactor	async_demo_fixed.c test
-47 ns context switches	Design + measurement
-85 ns goroutine creation	Design + measurement
-8 KB goroutine stacks	Code review of goroutine.c
-⚠️ Claim with Caveats
-Claim	Caveat
-"Fully integrated async I/O"	Say "epoll reactor working; scheduler integration is partial"
-"CSP channels"	Say "channels work standalone; scheduler integration is pending"
-"Unified API"	Say "API designed; core functions pending implementation"
-"Production-ready"	Say "scheduler is production-quality; I/O and API layers are not yet complete"
-❌ Do Not Claim
-Claim	Why
-"1M+ concurrent goroutines"	Only tested up to 100k
-"Zero-copy channels"	Not implemented
-"Cross-platform"	Linux only
-"Preemptive scheduling"	Cooperative only
-"Full GoLight API is available"	Only scattered module APIs
-Appendix B: Quick Sanity Check
-Before writing a report or submitting, run:
-
-bash
-make clean
-make test_work_stealing && ./test_work_stealing
-make bench
-gcc -pthread -o async_demo_fixed async_demo_fixed.c && ./async_demo_fixed
-# In another terminal: curl http://localhost:8888
-All four should succeed. If they do, the core claims in this report are safe.
+```
+
+One recorded run measured the following 10,000 no-op task throughput. Results
+vary by environment:
+
+| Workers | Time | Throughput |
+|---------|------|------------|
+| 1 | 0.658 s | 15,208 tasks/s |
+| 2 | 0.611 s | 16,362 tasks/s |
+| 4 | 0.629 s | 15,900 tasks/s |
+| 8 | 0.622 s | 16,069 tasks/s |
+
+## 11. Next Milestone Recommendation
+
+P1–P5 are complete. Before submission, rerun and investigate the latest
+`test_work_stealing` and `test_full_integration` failures. Further work in the
+current scope should focus on making their results reliable and repeatable.
+Afterward, potential extensions are cross-platform backends, metrics, tracing,
+and deadlock detection.
+
+## Appendix A: What We Can Confidently Claim
+
+### Safe to Claim
+
+| Claim | Evidence / qualification |
+|-------|--------------------------|
+| Guard-page stack overflow detection exists | `test_stack_overflow` prints a goroutine-specific diagnostic and exits 1 |
+| fd-based `async_select()` is implemented | `test_async_select` readiness, timeout, and worker-progress checks |
+| Fully integrated async read/write paths | Async read/write use scheduler park/ready; `test_async_goroutine` recorded 50/50 reads |
+| CSP channels work with goroutines | Channel waiter queues; `test_channel_integration` and `test_channel_no_blocking` passed |
+| Unified API is available | `golight.h` and `golight.c`; `make golight` |
+| 100 fast goroutines can complete | `test_100_fast` recorded 100 completion lines |
+
+### Claim with Caveats
+
+| Claim | Caveat |
+|-------|--------|
+| Full end-to-end integration passes | Latest `test_full_integration` run exited 139 |
+| Work-stealing stress test passes | Latest `test_work_stealing` run exited 139 |
+| Benchmark scales to 8 workers | A single measured run showed about 1.06× throughput over one worker, not a 7.2× speedup |
+
+### Do Not Claim
+
+- Do not claim preemptive scheduling, cross-platform support, channel
+  selection, dynamic stack growth, or an `async_accept()` implementation.
+- Do not claim 7.2× speedup, 47 ns context switches, 85 ns goroutine creation,
+  or 95% CPU utilization based on the current benchmark evidence.
+- Do not describe the complete stress-test suite as reliably passing until the
+  two observed exit-139 results have been resolved and rerun.

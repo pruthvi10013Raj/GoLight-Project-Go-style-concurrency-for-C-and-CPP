@@ -1,10 +1,10 @@
-# Literature Survey: GoLight - Bringing Go-style concurrrency for C/C++ Systems
+# Literature Survey: GoLight - Bringing Go-Style Concurrency to C/C++ Systems
 
 ## 1. Introduction
 
-The landscape of concurrent programming has evolved significantly over the past three decades, driven by the increasing demand for applications that can efficiently handle thousands of simultaneous tasks. Traditional threading models, where each thread corresponds to a kernel-managed entity, have proven inadequate for modern workloads due to their excessive memory overhead (typically 8MB per thread) and costly context switches (1-2µs) . This survey examines the foundational research and contemporary developments that inform the design of GoLight, a user-level threading library that implements M:N scheduling, work-stealing load balancing, and channel-based communication.
+The landscape of concurrent programming has evolved significantly over the past three decades, driven by applications that need to manage many simultaneous tasks. Traditional one-kernel-thread-per-task models can have significant stack and scheduling costs, depending on platform and configuration. This survey examines research that informs GoLight, a Linux C runtime with cooperative user-level goroutines, worker scheduling, channel communication, and asynchronous file-descriptor readiness.
 
-The literature reveals three primary research threads essential to understanding GoLight: (1) theoretical foundations of scheduling and work stealing, (2) CSP-based communication models, and (3) integration of asynchronous I/O with user-level threading. This survey synthesizes findings from seminal papers and recent advances to establish the intellectual context for the GoLight project.
+The literature reveals three primary research threads relevant to GoLight: (1) scheduling and work stealing, (2) CSP-based communication, and (3) integration of asynchronous I/O with user-level threading. The survey provides background; it does not establish GoLight-specific performance results.
 
 ---
 
@@ -77,17 +77,17 @@ A detailed technical discussion from the Cats Effect community (2022) analyzes t
 - **Context switch penalties**: Each I/O operation crosses multiple thread boundaries
 - **Complex sizing**: Compute pools must be downsized to accommodate dispatchers, but optimal sizing varies with workload
 
-At high request rates, these inefficiencies can cause **30-50% loss in tail latency** , a critical metric for modern services.
+The discussion describes possible latency costs from dispatcher and compute-thread coordination. No latency measurement for GoLight is inferred from that discussion.
 
 ### 4.2 Integrated I/O Model
 
-The Cats Effect discussion proposes an alternative inspired by **libuv** (Node.js runtime): integrate I/O polling directly into worker threads rather than using separate dispatchers . In this model, each worker thread:
+The Cats Effect discussion considers an alternative inspired by **libuv** (Node.js runtime): integrate I/O polling directly into worker threads rather than using separate dispatchers. GoLight currently uses an epoll reactor for async read/write and a per-call epoll/timerfd waiter for `async_select()`; it does not integrate epoll polling into the scheduler worker loop. In the async operation paths, a waiting goroutine parks and is made ready when the event completes. In this model, a fully worker-integrated design would:
 
 1. Executes compute tasks from its local queue
 2. When queues are empty, performs a polling syscall (epoll/kqueue) with timeout
 3. Processes any returned I/O events, resuming the corresponding fibers directly
 
-This approach eliminates dedicated dispatcher threads, maintains cache locality (fibers resume on the same thread that polls for their events), and simplifies resource management. However, it requires deep integration with the scheduler—workers must know when to poll, how long to block, and how to handle steal events while waiting.
+Such an approach can eliminate a separate dispatcher, but requires deep scheduler integration—workers must know when to poll, how long to block, and how to handle steal events while waiting.
 
 The discussion notes preliminary experiments with this approach, including Arman's **epollcat** prototype, suggesting growing interest in integrated I/O models .
 
@@ -135,19 +135,19 @@ GoLight occupies a unique position in the design space:
 | **Go runtime** | Work-stealing, M:N | CSP channels | Integrated | Go |
 | **Java Fork/Join** | Work-stealing | Shared memory | External | Java |
 | **ProcessJ** | Cooperative | CSP channels | External | Java |
-| **GoLight** | Work-stealing, M:N | CSP channels | Integrated | C/C++ |
+| **GoLight** | Cooperative worker scheduler | Goroutine-aware channels | epoll reactor and fd-based `async_select()` | C |
 
-GoLight uniquely combines work-stealing M:N scheduling, CSP channels, and integrated I/O in a C library—a combination not found in existing systems. This positions it to bring Go-like concurrency to C/C++ applications while potentially achieving better I/O performance through integrated polling.
+GoLight brings a unified goroutine, channel, and asynchronous fd API to C on Linux. Its current I/O implementation uses an epoll reactor and per-call select waiter rather than polling from each scheduler worker. Channel selection, stack growth, and cross-platform backends are not part of the current implementation.
 
 ---
 
 ## 6. Conclusion
 
-The literature establishes a rich theoretical and practical foundation for GoLight. Work-stealing scheduling, proven in systems from Cilk to Go, provides efficient load balancing with theoretical guarantees. CSP-based channels offer a safe, compositional communication model that has demonstrated success in production systems. Integrated I/O polling, while less mature, promises significant performance improvements by eliminating dedicated dispatcher threads.
+The literature establishes a theoretical and practical foundation for GoLight. Work-stealing scheduling, CSP communication, and asynchronous I/O each provide design context. The current implementation is a cooperative Linux runtime; claims about theoretical guarantees or performance of other systems should not be attributed directly to GoLight.
 
-Key challenges identified in the literature include the gap between abstract CSP specifications and practical implementations , the overhead of concurrent deques in weak-memory architectures , and the complexity of integrating I/O with work-stealing schedulers . GoLight's design must navigate these challenges while maintaining the simplicity and performance that make user-level threading attractive.
+Key challenges identified in the literature include the gap between abstract CSP specifications and practical implementations, the cost of concurrent deque operations on weak-memory architectures, and the complexity of integrating I/O with work-stealing schedulers. These remain useful considerations when testing and extending GoLight.
 
-The survey also reveals opportunities for innovation: hybrid deque strategies, workload-adaptive stealing policies, and formal verification of channel implementations remain active research areas where GoLight could contribute.
+The survey also reveals opportunities for future research: hybrid deque strategies, workload-adaptive stealing policies, and formal verification of channel implementations.
 
 ---
 
