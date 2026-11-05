@@ -5,7 +5,9 @@
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 
 static io_reactor_t reactor;
 static pthread_t reactor_thread;
@@ -14,6 +16,18 @@ typedef struct async_sleep_data {
     future_t* future;
     uint64_t milliseconds;
 } async_sleep_data_t;
+
+typedef struct async_select_request {
+    async_select_case_t* cases;
+    int ncases;
+    atomic_int result;
+    atomic_int error_code;
+    int done;
+    uint64_t timeout_ms;
+    goroutine_t* waiting_goroutine;
+    pthread_mutex_t lock;
+    pthread_cond_t completed;
+} async_select_request_t;
 
 static void mark_future_complete(future_t* f, int result) {
     f->result = result;
@@ -232,6 +246,211 @@ future_t* async_sleep(uint64_t milliseconds) {
     park_goroutine();
     
     return f;
+}
+
+static void* async_select_thread(void* arg) {
+    async_select_request_t* request = arg;
+    int epoll_fd = -1;
+    int timer_fd = -1;
+    int* duplicated_fds = NULL;
+    int result = -2;
+    int select_errno = 0;
+
+    duplicated_fds = malloc((size_t)request->ncases * sizeof(*duplicated_fds));
+    if (!duplicated_fds) goto complete;
+    for (int i = 0; i < request->ncases; i++) duplicated_fds[i] = -1;
+
+    epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd == -1) goto complete;
+
+    for (int i = 0; i < request->ncases; i++) {
+        async_select_case_t* select_case = &request->cases[i];
+        if (select_case->type == ASYNC_WAIT_TIMEOUT) continue;
+
+        int duplicate = dup(select_case->fd);
+        if (duplicate == -1) goto complete;
+        duplicated_fds[i] = duplicate;
+
+        struct epoll_event event = {0};
+        event.events = (select_case->type == ASYNC_WAIT_READ ? EPOLLIN : EPOLLOUT) |
+                       EPOLLONESHOT;
+        event.data.u64 = (uint64_t)i;
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, duplicate, &event) == -1) {
+            goto complete;
+        }
+    }
+
+    timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+    if (timer_fd == -1) goto complete;
+
+    struct epoll_event timer_event = {0};
+    timer_event.events = EPOLLIN;
+    timer_event.data.u64 = UINT64_MAX;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &timer_event) == -1) {
+        goto complete;
+    }
+
+    if (request->timeout_ms) {
+        struct itimerspec timer = {0};
+        timer.it_value.tv_sec = (time_t)(request->timeout_ms / 1000);
+        timer.it_value.tv_nsec =
+            (long)(request->timeout_ms % 1000) * 1000000L;
+        if (timerfd_settime(timer_fd, 0, &timer, NULL) == -1) goto complete;
+    } else {
+        struct epoll_event events[16];
+        int ready = epoll_wait(epoll_fd, events, 16, 0);
+        if (ready == -1) goto complete;
+        result = -1;
+        for (int i = 0; i < ready; i++) {
+            if (events[i].data.u64 != UINT64_MAX) {
+                result = (int)events[i].data.u64;
+                break;
+            }
+        }
+        if (result == -1) {
+            for (int i = 0; i < request->ncases; i++) {
+                if (request->cases[i].type == ASYNC_WAIT_TIMEOUT) {
+                    result = i;
+                    break;
+                }
+            }
+        }
+        goto complete;
+    }
+
+    for (;;) {
+        struct epoll_event events[16];
+        int ready = epoll_wait(epoll_fd, events, 16, -1);
+        if (ready == -1) {
+            if (errno == EINTR) continue;
+            goto complete;
+        }
+
+        for (int i = 0; i < ready; i++) {
+            if (events[i].data.u64 == UINT64_MAX) continue;
+            result = (int)events[i].data.u64;
+            goto complete;
+        }
+
+        uint64_t expirations;
+        if (read(timer_fd, &expirations, sizeof(expirations)) == sizeof(expirations)) {
+            result = -1;
+            for (int i = 0; i < request->ncases; i++) {
+                if (request->cases[i].type == ASYNC_WAIT_TIMEOUT) {
+                    result = i;
+                    break;
+                }
+            }
+            goto complete;
+        }
+    }
+
+complete:
+    if (result == -2) select_errno = errno;
+    if (epoll_fd != -1) close(epoll_fd);
+    if (timer_fd != -1) close(timer_fd);
+    if (duplicated_fds) {
+        for (int i = 0; i < request->ncases; i++) {
+            if (duplicated_fds[i] != -1) close(duplicated_fds[i]);
+        }
+        free(duplicated_fds);
+    }
+
+    if (result >= 0 && result < request->ncases) {
+        future_t* future = request->cases[result].future;
+        if (future) mark_future_complete(future, 1);
+    }
+
+    pthread_mutex_lock(&request->lock);
+    atomic_store_explicit(&request->result, result, memory_order_release);
+    atomic_store_explicit(&request->error_code, select_errno, memory_order_release);
+    request->done = 1;
+    pthread_cond_broadcast(&request->completed);
+    pthread_mutex_unlock(&request->lock);
+
+    if (request->waiting_goroutine) {
+        scheduler_ready(request->waiting_goroutine);
+    }
+    return NULL;
+}
+
+int async_select(async_select_case_t* cases, int ncases, uint64_t timeout_ms) {
+    if (!cases || ncases <= 0 ||
+        (size_t)ncases > SIZE_MAX / sizeof(*cases)) {
+        errno = EINVAL;
+        return -2;
+    }
+
+    for (int i = 0; i < ncases; i++) {
+        if (cases[i].type != ASYNC_WAIT_READ &&
+            cases[i].type != ASYNC_WAIT_WRITE &&
+            cases[i].type != ASYNC_WAIT_TIMEOUT) {
+            errno = EINVAL;
+            return -2;
+        }
+    }
+
+    async_select_request_t* request = calloc(1, sizeof(*request));
+    if (!request) return -2;
+    request->cases = malloc((size_t)ncases * sizeof(*cases));
+    if (!request->cases) {
+        free(request);
+        return -2;
+    }
+    memcpy(request->cases, cases, (size_t)ncases * sizeof(*cases));
+    request->ncases = ncases;
+    request->timeout_ms = timeout_ms;
+    request->waiting_goroutine = get_current_goroutine();
+    atomic_init(&request->result, -2);
+    atomic_init(&request->error_code, 0);
+
+    int error = pthread_mutex_init(&request->lock, NULL);
+    if (error != 0) {
+        free(request->cases);
+        free(request);
+        errno = error;
+        return -2;
+    }
+    error = pthread_cond_init(&request->completed, NULL);
+    if (error != 0) {
+        pthread_mutex_destroy(&request->lock);
+        free(request->cases);
+        free(request);
+        errno = error;
+        return -2;
+    }
+
+    pthread_t thread;
+    error = pthread_create(&thread, NULL, async_select_thread, request);
+    if (error != 0) {
+        pthread_cond_destroy(&request->completed);
+        pthread_mutex_destroy(&request->lock);
+        free(request->cases);
+        free(request);
+        errno = error;
+        return -2;
+    }
+    pthread_detach(thread);
+
+    if (request->waiting_goroutine) {
+        park_goroutine();
+    } else {
+        pthread_mutex_lock(&request->lock);
+        while (!request->done) {
+            pthread_cond_wait(&request->completed, &request->lock);
+        }
+        pthread_mutex_unlock(&request->lock);
+    }
+
+    int result = atomic_load_explicit(&request->result, memory_order_acquire);
+    int select_errno = atomic_load_explicit(&request->error_code,
+                                            memory_order_acquire);
+    pthread_cond_destroy(&request->completed);
+    pthread_mutex_destroy(&request->lock);
+    free(request->cases);
+    free(request);
+    if (result == -2 && select_errno) errno = select_errno;
+    return result;
 }
 
 void* io_reactor_thread(void* arg) {

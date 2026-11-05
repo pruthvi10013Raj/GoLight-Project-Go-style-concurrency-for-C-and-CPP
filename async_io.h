@@ -25,6 +25,18 @@ typedef struct future {
     struct future* next;
 } future_t;
 
+typedef enum {
+    ASYNC_WAIT_READ,
+    ASYNC_WAIT_WRITE,
+    ASYNC_WAIT_TIMEOUT
+} async_wait_type_t;
+
+typedef struct {
+    int fd;
+    async_wait_type_t type;
+    future_t* future;
+} async_select_case_t;
+
 // I/O event structure
 typedef struct io_event {
     int fd;
@@ -57,6 +69,7 @@ future_t* async_read(int fd, void* buf, size_t count);
 future_t* async_write(int fd, const void* buf, size_t count);
 future_t* async_accept(int fd);
 future_t* async_sleep(uint64_t milliseconds);
+int async_select(async_select_case_t* cases, int ncases, uint64_t timeout_ms);
 
 // Future operations
 int future_wait(future_t* f);

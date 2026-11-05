@@ -98,6 +98,7 @@ int scheduler_stealing_init(scheduler_stealing_t* s, int worker_count) {
 
 void scheduler_stealing_add(scheduler_stealing_t* s, goroutine_t* g) {
     if (!g) return;
+    int goroutine_id = g->id;
     
     g->scheduler = s;
     atomic_fetch_add(&s->active_goroutines, 1);
@@ -125,7 +126,7 @@ void scheduler_stealing_add(scheduler_stealing_t* s, goroutine_t* g) {
     }
 
     printf("Added goroutine %d to scheduler queue (active: %d)\n",
-           g->id, atomic_load(&s->active_goroutines));
+           goroutine_id, atomic_load(&s->active_goroutines));
 }
 
 void scheduler_stealing_start(scheduler_stealing_t* s) {
@@ -427,7 +428,9 @@ void scheduler_ready(goroutine_t* g) {
     int expected = GOROUTINE_BLOCKED;
     if (!atomic_compare_exchange_strong(&g->state, &expected, GOROUTINE_READY)) return;
 
-    int target = atomic_fetch_add(&s->next_worker, 1) % s->worker_count;
+    int target = g->worker_id >= 0
+                     ? g->worker_id
+                     : atomic_fetch_add(&s->next_worker, 1) % s->worker_count;
     worker_stealing_t* worker = &s->workers[target];
     pthread_mutex_lock(&worker->deque_lock);
     deque_push_bottom(&worker->deque, g);

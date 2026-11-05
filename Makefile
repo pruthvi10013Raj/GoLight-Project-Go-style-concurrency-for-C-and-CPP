@@ -29,6 +29,12 @@ test_stack_overflow: test_stack_overflow.c worker_stealing.c deque.c goroutine.c
 test_100_fast: test_100_fast.c worker_stealing.c deque.c goroutine.c
 	$(CC) $(CFLAGS) -o $@ $^
 
+test_full_integration: test_full_integration.c golight.c worker_stealing.c deque.c goroutine.c channel.c async_io.c
+	$(CC) $(CFLAGS) -o $@ $^
+
+test_async_select: test_async_select.c golight.c worker_stealing.c deque.c goroutine.c channel.c async_io.c
+	$(CC) $(CFLAGS) -o $@ $^
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -36,7 +42,7 @@ debug: CFLAGS = $(DEBUG_FLAGS) -pthread -D_GNU_SOURCE
 debug: test_work_stealing
 
 clean:
-	rm -f $(TARGETS) test_channel_integration test_channel_no_blocking test_stack_overflow test_100_fast *.o
+	rm -f $(TARGETS) test_channel_integration test_channel_no_blocking test_stack_overflow test_100_fast test_full_integration test_async_select *.o
 
 run: test_work_stealing
 	./test_work_stealing
